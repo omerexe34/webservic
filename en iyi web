@@ -1,0 +1,1820 @@
+import os, json, html, datetime, math, time
+from flask import Flask, render_template_string, request, jsonify, session
+from werkzeug.security import generate_password_hash, check_password_hash
+from supabase import create_client, Client
+
+app = Flask(__name__)
+app.secret_key = "cok-gizli-freerider-guvenlik-anahtari-2026-v4" 
+MAX_PAYLOAD_SIZE = 50 * 1024 * 1024 
+
+# ====================== SUPABASE KURULUMU ======================
+SUPABASE_URL = "https://klkxrhyyrqddxdrmzpwc.supabase.co"
+SUPABASE_KEY = "sb_publishable_fsMbna_EVYFlOABiPC8Ijw_5o2xTh73"
+
+try:
+    supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+    print("🚀 Supabase veritabanına başarıyla bağlanıldı!")
+except Exception as e:
+    print("🚀 SUPABASE BAĞLANTI HATASI:", e)
+    supabase = None
+
+def init_db():
+    if not supabase: return
+    
+    # Varsayılan bakım modu ayarı
+    try:
+        maint_res = supabase.table('settings').select('*').eq('id', 'maintenance').execute()
+        if not maint_res.data:
+            supabase.table('settings').insert({"id": "maintenance", "value": "false"}).execute()
+    except Exception as e:
+        print("Ayarlar tablosu kontrol hatası:", e)
+
+    # Admin kullanıcısı ayarı
+    try:
+        admin_res = supabase.table('users').select('*').eq('username', 'Admin').execute()
+        if not admin_res.data:
+            hashed_password = generate_password_hash("7260")
+            admin_data = {
+                "username": "Admin", 
+                "name": "Admin", 
+                "password": hashed_password, 
+                "xp": 99999, 
+                "avatar": "https://loremflickr.com/128/128/downhill,mountainbike?random=Admin", 
+                "bio": "Sistem yöneticisi", 
+                "role": "Admin", 
+                "stats": {"markers": 99, "events": 99, "market": 99},
+                "accepted_chat_rules": True 
+            }
+            supabase.table('users').insert(admin_data).execute()
+    except Exception as e:
+        print("Kullanıcılar tablosu kontrol hatası:", e)
+
+init_db()
+
+# ====================== API UÇ NOKTALARI ======================
+@app.route("/api/data", methods=["GET", "POST"])
+def api_data():
+    if not supabase:
+        return jsonify({'status': 'error', 'message': 'Veritabanı bağlantısı kurulamadı. Sunucu ayarlarını kontrol edin.'})
+
+    # Bakım modunu kontrol et
+    try:
+        maint_res = supabase.table('settings').select('*').eq('id', 'maintenance').execute()
+        maintenance_mode = (maint_res.data[0].get("value") == 'true') if maint_res.data else False
+    except:
+        maintenance_mode = False
+
+    if request.method == "GET":
+        today = datetime.datetime.now().strftime("%Y-%m-%d")
+        
+        # --- XP DAĞITIM KONTROLÜ (Günü gelen etkinlikler için) ---
+        try:
+            events_res = supabase.table('events').select('*').execute()
+            for ev_data in events_res.data:
+                ev_id = str(ev_data.get('id'))
+                ev_date = ev_data.get('datetime', '').split(' ')[0] 
+                
+                if ev_date <= today and not ev_data.get('xp_awarded'):
+                    creator = ev_data.get('creator')
+                    attendees = ev_data.get('attendees', [])
+                    
+                    if creator:
+                        u_res = supabase.table('users').select('*').eq('username', creator).execute()
+                        if u_res.data:
+                            u_d = u_res.data[0]
+                            new_xp = u_d.get('xp', 0) + 200
+                            stats = u_d.get('stats', {"markers":0, "events":0, "market":0})
+                            stats['events'] = stats.get('events', 0) + 1
+                            supabase.table('users').update({"xp": new_xp, "stats": stats}).eq('username', creator).execute()
+                    
+                    for att in attendees:
+                        if att != creator:
+                            att_res = supabase.table('users').select('*').eq('username', att).execute()
+                            if att_res.data:
+                                att_d = att_res.data[0]
+                                new_att_xp = att_d.get('xp', 0) + 100
+                                supabase.table('users').update({"xp": new_att_xp}).eq('username', att).execute()
+                    
+                    supabase.table('events').update({"xp_awarded": True}).eq('id', ev_id).execute()
+        except Exception as e:
+            print("XP Dağıtım Hatası:", e)
+        # -----------------------------------------------------------
+
+        safe_users = []
+        try:
+            users_res = supabase.table('users').select('*').execute()
+            for u in users_res.data:
+                u.pop('password', None)
+                safe_users.append(u)
+        except Exception: pass
+            
+        banned_users = []
+        try:
+            banned_res = supabase.table('banned').select('*').execute()
+            banned_users = [r['username'] for r in banned_res.data]
+        except Exception: pass
+        
+        db_data = {
+            'users': safe_users, 
+            'banned': banned_users, 
+            'maintenance': maintenance_mode
+        }
+        
+        tables = ['markers', 'messages', 'reports', 'news', 'market', 'events']
+        for table in tables:
+            try:
+                res = supabase.table(table).select('*').execute()
+                db_data[table] = res.data
+            except Exception:
+                db_data[table] = []
+            
+        return jsonify(db_data)
+        
+    elif request.method == "POST":
+        if request.content_length and request.content_length > MAX_PAYLOAD_SIZE:
+            return jsonify({'status': 'error', 'message': 'Gönderilen veri çok büyük! Dosyalarınızın boyutunu küçültün.'})
+
+        req = request.json
+        action = req.get('action')
+        data = req.get('data', {})
+        # MongoDB'deki data.pop('_id', None) kısmı Supabase için gerekli değil, sildik.
+        
+        try:
+            # Login & Register
+            if action == 'login':
+                if maintenance_mode and data.get('username') != 'Admin':
+                    return jsonify({'status': 'error', 'message': 'Sistem şu an bakım modunda. Lütfen daha sonra tekrar deneyin.'})
+                
+                username = html.escape(data.get('username', '').strip())
+                user_res = supabase.table('users').select('*').eq('username', username).execute()
+                
+                if user_res.data:
+                    user_data = user_res.data[0]
+                    banned_res = supabase.table('banned').select('*').eq('username', username).execute()
+                    if banned_res.data:
+                        return jsonify({'status': 'error', 'message': 'Hesabınız banlanmıştır!'})
+                    
+                    if check_password_hash(user_data.get('password', ''), data.get('password', '')):
+                        session['username'] = user_data['username']
+                        session['role'] = user_data.get('role', 'user')
+                        user_data.pop('password', None)
+                        return jsonify({'status': 'ok', 'user': user_data})
+                return jsonify({'status': 'error', 'message': 'Hatalı kullanıcı adı veya şifre!'})
+
+            elif action == 'register':
+                if maintenance_mode:
+                    return jsonify({'status': 'error', 'message': 'Sistem bakım modundayken kayıt olunamaz.'})
+                    
+                username = html.escape(data.get('username', '').strip())
+                user_res = supabase.table('users').select('*').eq('username', username).execute()
+                if user_res.data:
+                    return jsonify({'status': 'error', 'message': 'Bu kullanıcı adı zaten alınmış!'})
+                
+                data['username'] = username
+                data['name'] = html.escape(data.get('name', ''))
+                data['bio'] = html.escape(data.get('bio', ''))
+                data['city'] = html.escape(data.get('city', ''))
+                data['password'] = generate_password_hash(data.get('password', ''))
+                data['role'] = 'user'
+                data['xp'] = 100 # Default XP
+                data['stats'] = {"markers": 0, "events": 0, "market": 0}
+                data['accepted_chat_rules'] = False 
+                
+                supabase.table('users').insert(data).execute()
+                return jsonify({'status': 'ok'})
+
+            elif action == 'logout':
+                session.clear()
+                return jsonify({'status': 'ok'})
+
+            # --- OTURUM ŞART OLAN İŞLEMLER ---
+            if 'username' not in session:
+                return jsonify({'status': 'error', 'message': 'Giriş yapmalısınız!'})
+
+            current_username = session['username']
+            is_admin = session.get('role') == 'Admin'
+
+            if maintenance_mode and not is_admin:
+                session.clear()
+                return jsonify({'status': 'error', 'message': 'Sistem bakıma alındı, oturum sonlandırıldı.'})
+
+            # KULLANICI GÜNCELLEME
+            if action == 'update_user':
+                target_user = data.get('username')
+                if target_user != current_username and not is_admin:
+                    return jsonify({'status': 'error', 'message': 'Yetkisiz işlem!'})
+                
+                old_res = supabase.table('users').select('*').eq('username', target_user).execute()
+                if old_res.data:
+                    old_data = old_res.data[0]
+                    new_pass = data.get('password')
+                    data['password'] = generate_password_hash(new_pass) if (new_pass and new_pass.strip()) else old_data.get('password')
+                    data['name'] = html.escape(data.get('name', ''))
+                    data['bio'] = html.escape(data.get('bio', ''))
+                    data['stats'] = data.get('stats', old_data.get('stats', {"markers":0, "events":0, "market":0}))
+                    data['accepted_chat_rules'] = data.get('accepted_chat_rules', old_data.get('accepted_chat_rules', False))
+                    
+                    supabase.table('users').update(data).eq('username', target_user).execute()
+
+            elif action == 'accept_chat_rules':
+                supabase.table('users').update({"accepted_chat_rules": True}).eq('username', current_username).execute()
+
+            elif action == 'update_user_role':
+                if not is_admin: return jsonify({'status': 'error', 'message': 'Yetkisiz işlem!'})
+                target = data.get('username')
+                new_role = data.get('role')
+                supabase.table('users').update({"role": new_role}).eq('username', target).execute()
+
+            # HARİTA RAMPALARI VE İŞLEMLERİ
+            elif action == 'add_marker':
+                data['name'] = html.escape(data.get('name', ''))
+                data['desc'] = html.escape(data.get('desc', ''))
+                data['addedBy'] = current_username
+                if 'likes' not in data: data['likes'] = []
+                if 'fake_reports' not in data: data['fake_reports'] = []
+                data['id'] = str(data['id'])
+                
+                supabase.table('markers').upsert(data).execute()
+                
+            elif action == 'delete_marker':
+                if not is_admin: return jsonify({'status': 'error', 'message': 'Yetkisiz!'})
+                supabase.table('markers').delete().eq('id', str(data.get('id'))).execute()
+                
+            elif action == 'like_marker':
+                marker_id = str(data.get('id'))
+                m_res = supabase.table('markers').select('*').eq('id', marker_id).execute()
+                if m_res.data:
+                    m_data = m_res.data[0]
+                    likes = m_data.get('likes', [])
+                    if current_username in likes:
+                        likes.remove(current_username)
+                    else:
+                        likes.append(current_username)
+                    supabase.table('markers').update({"likes": likes}).eq('id', marker_id).execute()
+
+            elif action == 'report_marker_fake':
+                marker_id = str(data.get('id'))
+                m_res = supabase.table('markers').select('*').eq('id', marker_id).execute()
+                if m_res.data:
+                    m_data = m_res.data[0]
+                    reports = m_data.get('fake_reports', [])
+                    if current_username not in reports:
+                        reports.append(current_username)
+                        if len(reports) >= 3:
+                            supabase.table('markers').delete().eq('id', marker_id).execute()
+                        else:
+                            supabase.table('markers').update({"fake_reports": reports}).eq('id', marker_id).execute()
+
+            # CHAT MESAJLARI
+            elif action == 'add_message':
+                u_res = supabase.table('users').select('*').eq('username', current_username).execute()
+                if u_res.data:
+                    u_data = u_res.data[0]
+                    if not u_data.get('accepted_chat_rules', False) and current_username != "Admin":
+                        return jsonify({'status': 'error', 'message': 'Sohbet kurallarını kabul etmelisiniz!'})
+
+                if data.get('type') == 'text':
+                    data['text'] = html.escape(data.get('text', ''))
+                data['user'] = current_username
+                data['id'] = str(data['id'])
+                supabase.table('messages').upsert(data).execute()
+                
+            elif action == 'delete_message':
+                msg_id = str(data.get('id'))
+                msg_res = supabase.table('messages').select('*').eq('id', msg_id).execute()
+                if msg_res.data:
+                    msg_data = msg_res.data[0]
+                    if is_admin or msg_data.get('user') == current_username:
+                        supabase.table('messages').delete().eq('id', msg_id).execute()
+
+            # PAZAR YERİ
+            elif action == 'add_market':
+                today = datetime.datetime.now().strftime("%Y-%m-%d")
+                
+                user_ads_res = supabase.table('market').select('id').eq('owner', current_username).like('date', f'{today}%').execute()
+                user_ads_today = len(user_ads_res.data)
+                        
+                if user_ads_today >= 2 and not is_admin:
+                    return jsonify({'status': 'error', 'message': 'Günlük 2 adet ilan sınırını doldurdunuz!'})
+
+                data['title'] = html.escape(data.get('title', ''))
+                data['desc'] = html.escape(data.get('desc', ''))
+                data['contact'] = html.escape(data.get('contact', ''))
+                data['owner'] = current_username
+                data['date'] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+                data['id'] = str(data['id'])
+                
+                supabase.table('market').upsert(data).execute()
+
+            elif action == 'delete_market':
+                ad_id = str(data.get('id'))
+                ad_res = supabase.table('market').select('*').eq('id', ad_id).execute()
+                if ad_res.data:
+                    ad = ad_res.data[0]
+                    if ad.get('owner') == current_username or is_admin:
+                        supabase.table('market').delete().eq('id', ad_id).execute()
+                    else:
+                        return jsonify({'status': 'error', 'message': 'Bu ilanı silemezsiniz!'})
+
+            # SÜRÜŞ ETKİNLİKLERİ
+            elif action == 'add_event':
+                data['title'] = html.escape(data.get('title', ''))
+                data['desc'] = html.escape(data.get('desc', ''))
+                data['creator'] = current_username
+                data['attendees'] = [current_username]
+                data['xp_awarded'] = False
+                data['id'] = str(data['id'])
+                
+                supabase.table('events').upsert(data).execute()
+
+            elif action == 'join_event':
+                ev_id = str(data.get('id'))
+                event_res = supabase.table('events').select('*').eq('id', ev_id).execute()
+                if event_res.data:
+                    event = event_res.data[0]
+                    attendees = event.get('attendees', [])
+                    if current_username not in attendees:
+                        attendees.append(current_username)
+                        supabase.table('events').update({"attendees": attendees}).eq('id', ev_id).execute()
+                        
+            elif action == 'leave_event':
+                ev_id = str(data.get('id'))
+                event_res = supabase.table('events').select('*').eq('id', ev_id).execute()
+                if event_res.data:
+                    event = event_res.data[0]
+                    attendees = event.get('attendees', [])
+                    if current_username in attendees:
+                        attendees.remove(current_username)
+                        supabase.table('events').update({"attendees": attendees}).eq('id', ev_id).execute()
+
+            elif action == 'delete_event':
+                ev_id = str(data.get('id'))
+                event_res = supabase.table('events').select('*').eq('id', ev_id).execute()
+                if event_res.data:
+                    event = event_res.data[0]
+                    if event.get('creator') == current_username or is_admin:
+                        supabase.table('events').delete().eq('id', ev_id).execute()
+
+            # ŞİKAYET, BAN, HABER VE YÖNETİM
+            elif action == 'add_report':
+                report_id = str(data.get('user')) + "_" + current_username
+                data['reportedBy'] = current_username
+                data['reason'] = html.escape(data.get('reason', 'Neden belirtilmedi'))
+                data['id'] = report_id
+                supabase.table('reports').upsert(data).execute()
+
+            elif action == 'add_ban':
+                if not is_admin: return jsonify({'status': 'error', 'message': 'Yetkisiz!'})
+                supabase.table('banned').upsert({"username": data.get('username')}).execute()
+
+            elif action == 'add_news':
+                if not is_admin: return jsonify({'status': 'error', 'message': 'Yetkisiz!'})
+                data['title'] = html.escape(data.get('title', ''))
+                data['content'] = html.escape(data.get('content', ''))
+                data['id'] = str(data['id'])
+                supabase.table('news').upsert(data).execute()
+
+            elif action == 'delete_news':
+                if not is_admin: return jsonify({'status': 'error', 'message': 'Yetkisiz!'})
+                supabase.table('news').delete().eq('id', str(data['id'])).execute()
+                
+            elif action == 'toggle_maintenance':
+                if not is_admin: return jsonify({'status': 'error', 'message': 'Yetkisiz!'})
+                val = 'true' if data.get('status') else 'false'
+                supabase.table('settings').upsert({"id": "maintenance", "value": val}).execute()
+
+            return jsonify({'status': 'ok'})
+            
+        except Exception as e:
+            print("HATA:", e)
+            return jsonify({'status': 'error', 'message': f'İşlem sırasında bir hata oluştu: {e}'})
+
+# ====================== HTML VE FRONTEND ======================
+HTML_CODE = """<!DOCTYPE html>
+<html lang="tr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Türkiye Freerider Grubu</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Teko:wght@400;600;700&display=swap');
+        @import url('https://fonts.googleapis.com/css2?family=Press+Start+2P&display=swap');
+        
+        body { font-family: system-ui, sans-serif; background-color: #050505; margin: 0; padding: 0; overscroll-behavior: none; color: #e4e4e7; }
+        .downhill-font { font-family: 'Press Start 2P', cursive; }
+        .teko-font { font-family: 'Teko', sans-serif; text-transform: uppercase; }
+        
+        #map { height: 100% !important; width: 100% !important; z-index: 10; filter: contrast(1.1) saturate(1.2); }
+        .neon-glow { text-shadow: 0 0 10px rgb(220 38 38), 0 0 20px rgb(220 38 38); }
+        ::-webkit-scrollbar { width: 0px; background: transparent; }
+        
+        /* Agresif Tema Renkleri */
+        .bg-darker { background-color: #0a0a0c; }
+        .border-blood { border-color: #7f1d1d; }
+        .text-blood { color: #f87171; }
+        
+        .marker-pulse { animation: pulse-ring 2s cubic-bezier(0.215, 0.61, 0.355, 1) infinite; }
+        @keyframes pulse-ring { 0% { transform: scale(0.8); opacity: 0.5; } 100% { transform: scale(2.5); opacity: 0; } }
+        .tab-btn { transition: all 0.2s; }
+        .market-img-scroll { display: flex; overflow-x: auto; scroll-snap-type: x mandatory; gap: 10px; }
+        .market-img-scroll img { scroll-snap-align: center; max-width: 100%; border-radius: 8px; border: 1px solid #3f3f46; }
+        
+        /* Harita Pop-Up stil düzeltmeleri (karanlık temaya uygun) */
+        .leaflet-popup-content-wrapper { background: #121214; color: white; border-radius: 12px; border: 1px solid #7f1d1d; box-shadow: 0 10px 30px rgba(0,0,0,0.9); }
+        .leaflet-popup-tip { background: #121214; }
+        .leaflet-popup-content { margin: 12px; }
+        .leaflet-popup-close-button { color: #f87171 !important; text-shadow: none; }
+
+        /* Scrollbar Gizleme Sınıfı */
+        .custom-scrollbar::-webkit-scrollbar { width: 4px; }
+        .custom-scrollbar::-webkit-scrollbar-thumb { background: #52525b; border-radius: 4px; }
+        
+        /* Harita crosshair (Ekleme modu) */
+        .map-add-mode { cursor: crosshair !important; }
+    </style>
+</head>
+<body class="text-zinc-200 h-[100dvh] w-full overflow-hidden">
+    <audio id="notif-sound" src="https://actions.google.com/sounds/v1/cartoon/pop.ogg" preload="auto"></audio>
+
+    <div class="max-w-md mx-auto h-[100dvh] flex flex-col shadow-2xl bg-darker border-x border-zinc-800 relative">
+
+        <div id="login-screen" class="flex-1 flex flex-col overflow-y-auto z-50 bg-darker relative">
+            <div class="bg-gradient-to-b from-red-950 via-zinc-900 to-darker flex flex-col items-center justify-center py-12 relative overflow-hidden shrink-0 border-b border-blood">
+                <div class="absolute inset-0 flex items-center justify-center text-[160px] opacity-5 pointer-events-none text-red-600">💀</div>
+                <div class="text-center relative z-10">
+                    <div class="text-6xl mb-4 drop-shadow-2xl grayscale contrast-200">🚵‍♂️💥</div>
+                    <h1 class="downhill-font text-3xl text-red-500 tracking-[1px] neon-glow">FREERIDER</h1>
+                    <p class="teko-font text-zinc-400 text-xl mt-2 tracking-widest">TÜRKİYE GRUBU</p>
+                </div>
+            </div>
+            <div class="p-6 bg-darker flex-1">
+                <div class="flex border-b border-zinc-800 mb-6 shrink-0">
+                    <button onclick="showLoginTab()" id="login-tab-btn" class="flex-1 py-3 border-b-2 border-red-600 text-red-500 font-bold transition-all teko-font text-xl">GİRİŞ YAP</button>
+                    <button onclick="showRegisterTab()" id="register-tab-btn" class="flex-1 py-3 text-zinc-600 transition-all teko-font text-xl">KAYIT OL</button>
+                </div>
+                
+                <div id="login-form">
+                    <input id="login-username" type="text" placeholder="Kullanıcı Adı" class="w-full bg-zinc-900 border border-zinc-800 rounded-xl px-5 py-4 mb-4 focus:border-red-600 outline-none text-white transition">
+                    <input id="login-password" type="password" placeholder="Şifre" class="w-full bg-zinc-900 border border-zinc-800 rounded-xl px-5 py-4 mb-4 focus:border-red-600 outline-none text-white transition">
+                    
+                    <div class="flex items-center gap-2 mb-6 px-1">
+                        <input type="checkbox" id="remember-me" class="w-4 h-4 accent-red-600 cursor-pointer">
+                        <label for="remember-me" class="text-sm text-zinc-400 cursor-pointer">Kullanıcı adımı hatırla</label>
+                    </div>
+
+                    <button onclick="handleLogin()" class="w-full bg-red-700 hover:bg-red-600 py-4 rounded-xl font-bold shadow-[0_0_15px_rgba(185,28,28,0.5)] transition text-white tracking-wider teko-font text-2xl">SİSTEME GİR 🏁</button>
+                </div>
+                
+                <div id="register-form" class="hidden">
+                    <input id="reg-name" type="text" placeholder="Ad Soyad" class="w-full bg-zinc-900 border border-zinc-800 rounded-xl px-5 py-4 mb-3 outline-none text-white focus:border-red-600 transition">
+                    <input id="reg-username" type="text" placeholder="Kullanıcı Adı" class="w-full bg-zinc-900 border border-zinc-800 rounded-xl px-5 py-4 mb-3 outline-none text-white focus:border-red-600 transition">
+                    <input id="reg-city" type="text" placeholder="Şehir" class="w-full bg-zinc-900 border border-zinc-800 rounded-xl px-5 py-4 mb-3 outline-none text-white focus:border-red-600 transition">
+                    <input id="reg-password" type="password" placeholder="Şifre" class="w-full bg-zinc-900 border border-zinc-800 rounded-xl px-5 py-4 mb-6 outline-none text-white focus:border-red-600 transition">
+                    <button onclick="handleRegister()" class="w-full bg-red-700 hover:bg-red-600 py-4 rounded-xl font-bold mb-10 shadow-[0_0_15px_rgba(185,28,28,0.5)] transition text-white tracking-wider teko-font text-2xl">SAHAYA İN 🏔️</button>
+                </div>
+            </div>
+        </div>
+
+        <div id="main-app" class="hidden flex flex-col h-[100dvh] w-full">
+            <div class="bg-darker border-b border-blood px-5 py-3 flex items-center justify-between z-[100] shrink-0 shadow-lg">
+                <div onclick="switchTab(0)" class="flex items-center gap-2 cursor-pointer">
+                    <span class="text-3xl drop-shadow-md">🏔️</span>
+                    <div>
+                        <span class="teko-font text-red-500 text-2xl tracking-widest neon-glow font-bold">FREERIDER TR</span>
+                    </div>
+                </div>
+                <div onclick="showProfile()" class="flex items-center gap-2 cursor-pointer">
+                    <div class="text-right">
+                        <div id="top-username" class="font-bold text-sm text-white">User</div>
+                        <div id="top-title" class="text-red-400 text-[10px] font-bold uppercase tracking-wider">Çaylak</div>
+                    </div>
+                    <img id="top-avatar" src="" class="w-10 h-10 rounded-lg object-cover border-2 border-red-600 shadow-sm">
+                </div>
+            </div>
+
+            <div class="flex-1 relative overflow-hidden bg-zinc-950 z-0">
+                
+                <div id="screen-map" class="absolute inset-0 flex flex-col z-10">
+                    <div class="absolute top-4 left-4 right-4 flex justify-between z-[999] gap-2">
+                        <button onclick="showNearbyRoutes()" class="flex-1 bg-zinc-900/90 border border-zinc-700 hover:border-red-500 py-2 rounded-xl shadow-lg text-sm font-bold text-zinc-300 backdrop-blur-md transition">📍 Yakın Rotalar</button>
+                    </div>
+                    
+                    <div id="map" class="flex-1 w-full h-full"></div>
+                    
+                    <div class="absolute bottom-6 right-4 flex flex-col gap-3 z-[999] items-end">
+                        <button onclick="autoZoomToUserLocation()" class="bg-zinc-900 hover:bg-zinc-800 w-12 h-12 rounded-full shadow-[0_0_15px_rgba(0,0,0,0.8)] flex items-center justify-center text-xl border border-zinc-700 transition">🎯</button>
+                        
+                        <button onclick="toggleAddEventMode()" id="btn-add-event-mode" class="bg-blue-700 hover:bg-blue-600 px-4 py-3 rounded-xl shadow-lg flex items-center justify-center text-sm font-bold text-white border border-blue-900 transition">📅 Buluşma İşaretle</button>
+                        
+                        <button onclick="toggleAddMarkerMode()" id="btn-add-marker-mode" class="bg-red-700 hover:bg-red-600 px-4 py-3 rounded-xl shadow-lg flex items-center justify-center text-sm font-bold text-white border border-red-900 transition">📍 Rampa İşaretle</button>
+                    </div>
+                </div>
+
+                <div id="screen-chat" class="hidden absolute inset-0 flex flex-col z-20 bg-darker">
+                    <div class="bg-zinc-900 p-3 flex justify-between items-center border-b border-zinc-800 shrink-0 shadow-sm z-10">
+                        <span class="text-red-500 font-bold flex items-center gap-2 teko-font text-xl tracking-wide">💬 GRUP SOHBETİ <span class="text-xs text-zinc-500 font-normal font-sans ml-2">Kurallara uyun.</span></span>
+                    </div>
+                    <div id="chat-messages" class="flex-1 overflow-y-auto p-4 space-y-4 scroll-smooth min-h-0 custom-scrollbar"></div>
+                    
+                    <div class="bg-zinc-900 p-3 flex gap-2 border-t border-zinc-800 shrink-0 pb-safe z-10">
+                        <button onclick="openPhotoUpload()" class="bg-zinc-800 w-12 h-12 flex items-center justify-center rounded-xl text-xl shrink-0 hover:bg-zinc-700 transition border border-zinc-700">📸</button>
+                        <button onclick="toggleVoiceRecord()" id="voice-btn" class="bg-zinc-800 w-12 h-12 flex items-center justify-center rounded-xl text-xl shrink-0 hover:bg-zinc-700 transition border border-zinc-700">🎤</button>
+                        <input id="chat-input" type="text" placeholder="Mesaj yaz..." class="flex-1 bg-zinc-950 border border-zinc-800 rounded-xl px-4 text-sm focus:outline-none focus:border-red-600 text-white min-w-0 transition">
+                        <button onclick="sendChatMessage()" class="bg-red-700 px-5 rounded-xl font-bold text-white hover:bg-red-600 transition shrink-0 uppercase text-xs tracking-wider">Gönder</button>
+                    </div>
+                </div>
+
+                <div id="screen-market" class="hidden absolute inset-0 bg-darker overflow-y-auto p-4 z-20 custom-scrollbar">
+                    <div class="flex justify-between items-center mb-6 border-b border-zinc-800 pb-3">
+                        <h2 class="text-2xl text-red-500 flex items-center gap-2 teko-font tracking-wide">🛒 EKİPMAN PAZARI</h2>
+                        <button onclick="openMarketModal()" class="bg-red-700 hover:bg-red-600 text-white text-xs px-4 py-2 rounded-lg font-bold shadow-md transition">+ İLAN VER</button>
+                    </div>
+                    <div id="market-list" class="grid grid-cols-2 gap-3 pb-10"></div>
+                </div>
+
+                <div id="screen-rank" class="hidden absolute inset-0 bg-darker overflow-y-auto p-4 z-20 custom-scrollbar">
+                    <h2 class="text-2xl mb-6 text-red-500 teko-font tracking-wide border-b border-zinc-800 pb-3">🏆 TÜRKİYE LİDERLERİ</h2>
+                    <div id="leaderboard" class="space-y-3 pb-10"></div>
+                </div>
+
+                <div id="screen-news" class="hidden absolute inset-0 bg-darker overflow-y-auto p-4 z-20 custom-scrollbar">
+                    <h2 class="text-2xl mb-6 text-red-500 teko-font tracking-wide border-b border-zinc-800 pb-3">📰 HABERLER</h2>
+                    <div id="news-list" class="space-y-4 pb-10"></div>
+                </div>
+
+                <div id="screen-profile" class="hidden absolute inset-0 bg-darker overflow-y-auto z-20 custom-scrollbar">
+                    <div class="p-6 text-center pb-20">
+                        <div class="relative inline-block">
+                            <img id="profile-avatar" onclick="changeProfilePic()" src="" class="w-32 h-32 mx-auto rounded-xl object-cover border-4 border-red-700 shadow-[0_0_20px_rgba(185,28,28,0.4)] cursor-pointer">
+                            <div class="absolute -bottom-2 -right-2 bg-zinc-900 border border-zinc-700 rounded-full p-2 cursor-pointer text-xs" onclick="changeProfilePic()">📷</div>
+                        </div>
+                        <input id="pic-upload" type="file" accept="image/*" class="hidden" onchange="uploadProfilePic(this)">
+                        
+                        <div id="profile-name" class="text-2xl font-bold mt-4 text-white"></div>
+                        <div id="profile-bio" class="text-zinc-500 mt-1 text-sm italic"></div>
+                        
+                        <div class="flex justify-center gap-4 mt-6 text-sm bg-zinc-900/50 py-4 rounded-2xl border border-zinc-800">
+                            <div class="text-center w-24">
+                                <div id="profile-xp" class="text-3xl teko-font tracking-wider text-red-500">0</div>
+                                <div class="text-[10px] text-zinc-500 mt-1 font-bold">XP</div>
+                            </div>
+                            <div class="text-center border-l border-zinc-800 pl-4 w-24">
+                                <div id="profile-title" class="text-lg font-bold text-white uppercase mt-1">Çaylak</div>
+                                <div class="text-[10px] text-zinc-500 mt-1 font-bold">UNVAN</div>
+                            </div>
+                        </div>
+
+                        <div class="mt-6 text-left bg-zinc-900/30 p-4 rounded-xl border border-zinc-800">
+                            <h3 class="text-xs font-bold text-zinc-600 mb-3 uppercase tracking-wider">Kazanılan Rozetler</h3>
+                            <div id="profile-badges" class="flex flex-wrap gap-2"></div>
+                        </div>
+
+                        <div class="mt-8 space-y-3">
+                            <button onclick="openSettingsModal()" class="w-full bg-zinc-800 hover:bg-zinc-700 py-4 rounded-xl font-bold text-white transition border border-zinc-700">⚙️ AYARLAR & DÜZENLE</button>
+                            <button onclick="logout()" class="w-full bg-red-950/30 hover:bg-red-900/50 py-4 rounded-xl text-red-400 font-bold transition border border-red-900/30">ÇIKIŞ YAP</button>
+                            <button id="admin-btn" onclick="showAdminPanel()" class="hidden w-full bg-amber-700 hover:bg-amber-600 py-4 rounded-xl font-bold shadow-lg mt-6 text-white transition border border-amber-900 teko-font text-xl tracking-wider">👑 YÖNETİM PANELİ</button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="bg-darker border-t border-blood grid grid-cols-5 text-[10px] z-[100] shrink-0 pb-safe shadow-[0_-10px_30px_rgba(0,0,0,0.8)]">
+                <button id="tab-btn-0" onclick="switchTab(0)" class="py-3 flex flex-col items-center gap-1 text-red-500 tab-btn font-bold">🗺️<br>Harita</button>
+                <button id="tab-btn-1" onclick="switchTab(1)" class="py-3 flex flex-col items-center gap-1 text-zinc-500 tab-btn font-bold">💬<br>Chat</button>
+                <button id="tab-btn-2" onclick="switchTab(2)" class="py-3 flex flex-col items-center gap-1 text-zinc-500 tab-btn font-bold">🛒<br>Pazar</button>
+                <button id="tab-btn-3" onclick="switchTab(3)" class="py-3 flex flex-col items-center gap-1 text-zinc-500 tab-btn font-bold">🏆<br>Skor</button>
+                <button id="tab-btn-5" onclick="switchTab(5)" class="py-3 flex flex-col items-center gap-1 text-zinc-500 tab-btn font-bold">👤<br>Profil</button>
+            </div>
+        </div>
+
+        <div id="chat-rules-modal" class="hidden fixed inset-0 bg-black/95 flex items-center justify-center z-[9999] px-4 py-10 backdrop-blur-md">
+            <div class="bg-zinc-900 w-full max-w-md rounded-2xl p-6 border border-blood max-h-full flex flex-col shadow-2xl">
+                <h2 class="text-3xl text-red-500 mb-2 shrink-0 flex items-center gap-2 teko-font tracking-wide">📜 TOPLULUK KURALLARI</h2>
+                <p class="text-xs text-zinc-400 mb-4 shrink-0">Grubumuzda sağlıklı iletişim için aşağıdaki kuralları okuyup onaylamanız zorunludur.</p>
+                
+                <div class="overflow-y-auto flex-1 text-sm text-zinc-300 space-y-4 pr-2 custom-scrollbar bg-darker p-4 rounded-xl border border-zinc-800">
+                    <ul class="list-disc pl-5 space-y-3">
+                        <li><b>+18 ve Cinsel İçerik Kesinlikle Yasaktır:</b> Gruba gönderilen her türlü cinsel içerik, +18 görsel, video veya metinsel imalar yasaktır. Tespit edildiğinde hesap kalıcı olarak engellenir.</li>
+                        <li><b>Taciz ve Zorbalık Yasaktır:</b> Diğer üyeleri özelden veya gruptan rahatsız etmek, tehdit etmek, aşağılamak veya zorbalık yapmak affedilmez.</li>
+                        <li><b>Ayrımcılık ve Nefret Söylemi:</b> Din, dil, ırk, mezhep, cinsiyet üzerinden ayrımcılık yapmak, nefret söyleminde bulunmak yasaktır. Bizi birleştiren şey bisiklet tutkusudur.</li>
+                        <li><b>Spam ve Reklam Yasaktır:</b> İzin alınmadan yapılan ticari reklamlar ve sürekli aynı mesajın atılması yasaktır. Pazar sekmesini kullanın.</li>
+                        <li><b>Yasadışı İçerikler:</b> Yasalara aykırı içerik, suça teşvik, tehlikeli madde övgüsü yasaktır.</li>
+                    </ul>
+                    <p class="text-xs text-red-400 font-bold mt-4 border-t border-zinc-800 pt-3">
+                        ÖNEMLİ: İhlal edenler uyarısız KALICI BANLANIR.
+                    </p>
+                </div>
+                
+                <div class="mt-4 shrink-0 flex flex-col gap-2">
+                    <button onclick="acceptChatRules()" class="w-full bg-red-700 hover:bg-red-600 py-4 rounded-xl font-bold text-white shadow-lg transition tracking-widest teko-font text-xl">KABUL EDİYORUM</button>
+                    <button onclick="switchTab(0)" class="w-full bg-zinc-800 hover:bg-zinc-700 py-3 rounded-xl font-bold text-zinc-400 transition text-sm">Vazgeç (Haritaya Dön)</button>
+                </div>
+            </div>
+        </div>
+
+        <div id="settings-modal" class="hidden fixed inset-0 bg-black/95 flex items-center justify-center z-[9999] px-4 backdrop-blur-sm">
+            <div class="bg-zinc-900 w-full max-w-md rounded-2xl p-6 border border-zinc-700 shadow-2xl">
+                <h3 class="text-3xl text-red-500 mb-6 teko-font tracking-wide">⚙️ PROFİL DÜZENLE</h3>
+                <input id="edit-name" type="text" placeholder="İsim" class="w-full bg-zinc-950 border border-zinc-800 rounded-xl px-5 py-4 mb-3 outline-none focus:border-red-600 text-white transition">
+                <input id="edit-bio" type="text" placeholder="Kısa Bio..." class="w-full bg-zinc-950 border border-zinc-800 rounded-xl px-5 py-4 mb-3 outline-none focus:border-red-600 text-white transition">
+                <input id="edit-password" type="password" placeholder="Yeni şifre (Boş bırakırsan değişmez)" class="w-full bg-zinc-950 border border-zinc-800 rounded-xl px-5 py-4 outline-none focus:border-red-600 text-white transition">
+                <div class="grid grid-cols-2 gap-3 mt-8">
+                    <button onclick="closeSettingsModal()" class="py-4 bg-zinc-800 rounded-xl font-bold hover:bg-zinc-700 text-white transition">İPTAL</button>
+                    <button onclick="saveSettings()" class="py-4 bg-red-700 rounded-xl font-bold hover:bg-red-600 text-white transition">KAYDET</button>
+                </div>
+            </div>
+        </div>
+
+        <div id="add-marker-modal" class="hidden fixed inset-0 bg-black/95 flex items-center justify-center z-[9999] px-4 backdrop-blur-sm">
+            <div class="bg-zinc-900 w-full max-w-md rounded-2xl p-6 border border-blood overflow-y-auto max-h-[90dvh] shadow-2xl">
+                <h2 class="text-3xl text-red-500 mb-4 flex items-center gap-2 teko-font tracking-wide">📍 YENİ RAMPA/KONUM</h2>
+                
+                <label class="block text-xs text-zinc-500 mb-2 font-bold uppercase tracking-wider">Fotoğraf Seç</label>
+                <img id="new-marker-preview" class="hidden w-full h-32 object-cover rounded-xl mb-4 border border-zinc-700">
+                <input id="new-marker-photo" type="file" accept="image/*" class="w-full bg-zinc-950 border border-zinc-800 rounded-xl px-2 py-2 mb-4 text-xs cursor-pointer text-zinc-400" onchange="previewMarkerPhoto(this)">
+
+                <input id="new-marker-name" type="text" placeholder="Rampa veya Konum Adı" class="w-full bg-zinc-950 border border-zinc-800 rounded-xl px-5 py-4 mb-3 outline-none text-white focus:border-red-600 transition">
+                <select id="new-marker-difficulty" class="w-full bg-zinc-950 border border-zinc-800 rounded-xl px-5 py-4 mb-3 outline-none text-zinc-300 focus:border-red-600 transition">
+                    <option value="Kolay">🟢 Kolay Seviye</option>
+                    <option value="Orta" selected>🟡 Orta Seviye</option>
+                    <option value="Zor">🔴 Zor Seviye</option>
+                    <option value="Tehlike">💀 Çok Tehlikeli</option>
+                </select>
+                <textarea id="new-marker-desc" placeholder="Açıklama / Nasıl gidilir / İpuçları..." class="w-full bg-zinc-950 border border-zinc-800 rounded-xl px-5 py-4 h-24 mb-6 outline-none text-white custom-scrollbar focus:border-red-600 transition"></textarea>
+
+                <div class="grid grid-cols-2 gap-3">
+                    <button onclick="document.getElementById('add-marker-modal').classList.add('hidden')" class="py-4 bg-zinc-800 rounded-xl font-bold text-white hover:bg-zinc-700 transition">İPTAL</button>
+                    <button onclick="saveNewMarker()" class="py-4 bg-red-700 rounded-xl font-bold text-white hover:bg-red-600 shadow-lg transition">KAYDET</button>
+                </div>
+            </div>
+        </div>
+
+        <div id="add-event-modal" class="hidden fixed inset-0 bg-black/95 flex items-center justify-center z-[9999] px-4 backdrop-blur-sm">
+            <div class="bg-zinc-900 w-full max-w-md rounded-2xl p-6 border border-blue-900 shadow-2xl">
+                <h2 class="text-3xl text-blue-500 mb-4 teko-font tracking-wide">📅 SÜRÜŞ OLUŞTUR</h2>
+                <input id="ev-title" type="text" placeholder="Buluşma Başlığı (Örn: Sabah Sürüşü)" class="w-full bg-zinc-950 border border-zinc-800 rounded-xl px-5 py-4 mb-3 outline-none text-white focus:border-blue-600 transition">
+                <div class="flex gap-2 mb-3">
+                    <input id="ev-date" type="date" class="flex-1 bg-zinc-950 border border-zinc-800 rounded-xl px-4 py-4 outline-none text-sm text-zinc-300 focus:border-blue-600 transition">
+                    <input id="ev-time" type="time" class="w-24 bg-zinc-950 border border-zinc-800 rounded-xl px-2 py-4 outline-none text-sm text-zinc-300 focus:border-blue-600 transition">
+                </div>
+                <input id="ev-max" type="number" placeholder="Kişi Sınırı (Opsiyonel)" class="w-full bg-zinc-950 border border-zinc-800 rounded-xl px-5 py-4 mb-3 outline-none text-white focus:border-blue-600 transition">
+                <textarea id="ev-desc" placeholder="Açıklama..." class="w-full bg-zinc-950 border border-zinc-800 rounded-xl px-5 py-4 h-20 mb-4 outline-none text-white custom-scrollbar focus:border-blue-600 transition"></textarea>
+                <div class="text-xs text-zinc-500 mb-6 text-center">Buluşma kurmak sana günü geldiğinde <span class="text-red-500 font-bold">+200 XP</span> kazandırır!</div>
+                <div class="grid grid-cols-2 gap-3">
+                    <button onclick="document.getElementById('add-event-modal').classList.add('hidden')" class="py-4 bg-zinc-800 rounded-xl font-bold text-white transition hover:bg-zinc-700">İPTAL</button>
+                    <button onclick="saveEvent()" class="py-4 bg-blue-700 rounded-xl font-bold text-white transition hover:bg-blue-600 shadow-lg">OLUŞTUR</button>
+                </div>
+            </div>
+        </div>
+
+        <div id="market-modal" class="hidden fixed inset-0 bg-black/95 flex items-center justify-center z-[9999] px-4 overflow-y-auto py-10 backdrop-blur-sm">
+            <div class="bg-zinc-900 w-full max-w-md rounded-2xl p-6 border border-zinc-700 my-auto shadow-2xl">
+                <h2 class="text-3xl text-red-500 mb-4 teko-font tracking-wide">🛒 YENİ İLAN VER</h2>
+                <input id="mk-title" type="text" placeholder="Ürün Adı" class="w-full bg-zinc-950 border border-zinc-800 rounded-xl px-5 py-4 mb-3 outline-none text-white focus:border-red-600 transition">
+                <input id="mk-price" type="text" placeholder="Fiyat (TL)" class="w-full bg-zinc-950 border border-zinc-800 rounded-xl px-5 py-4 mb-3 outline-none text-white focus:border-red-600 transition">
+                <input id="mk-contact" type="text" placeholder="İletişim (Tel veya Instagram)" class="w-full bg-zinc-950 border border-zinc-800 rounded-xl px-5 py-4 mb-3 outline-none text-white focus:border-red-600 transition">
+                <textarea id="mk-desc" placeholder="Ürün açıklaması durumu vb..." class="w-full bg-zinc-950 border border-zinc-800 rounded-xl px-5 py-4 h-24 mb-3 outline-none text-white custom-scrollbar focus:border-red-600 transition"></textarea>
+                
+                <label class="block text-xs text-zinc-500 mb-2 uppercase tracking-wider font-bold">Fotoğraflar (Max 5 adet)</label>
+                <input id="mk-photos" type="file" accept="image/*" multiple class="w-full bg-zinc-950 border border-zinc-800 rounded-xl px-2 py-2 mb-4 text-xs text-zinc-400">
+                <div id="mk-preview" class="flex gap-2 overflow-x-auto mb-6 hidden custom-scrollbar"></div>
+
+                <div class="grid grid-cols-2 gap-3">
+                    <button onclick="document.getElementById('market-modal').classList.add('hidden')" class="py-4 bg-zinc-800 rounded-xl font-bold text-white transition hover:bg-zinc-700">İPTAL</button>
+                    <button onclick="saveMarketItem()" class="py-4 bg-red-700 rounded-xl font-bold text-white transition hover:bg-red-600 shadow-lg">İLAN VER</button>
+                </div>
+            </div>
+        </div>
+
+        <div id="event-sheet" class="hidden fixed bottom-0 left-1/2 -translate-x-1/2 max-w-md w-full bg-zinc-900 border-t-4 border-blue-600 rounded-t-2xl shadow-[0_-15px_40px_rgba(0,0,0,0.9)] p-6 z-[9999] transition-transform">
+            <div class="flex justify-between items-start mb-4 border-b border-zinc-800 pb-2">
+                <div>
+                    <h3 id="es-title" class="text-2xl text-blue-500 teko-font tracking-wide"></h3>
+                    <p id="es-time" class="text-xs text-zinc-400 font-bold mt-1 uppercase">📅 Tarih - Saat</p>
+                </div>
+                <button onclick="document.getElementById('event-sheet').classList.add('hidden')" class="text-2xl text-zinc-600 hover:text-white transition">✕</button>
+            </div>
+            <p id="es-desc" class="text-sm text-zinc-300 mb-4 bg-darker p-4 rounded-xl custom-scrollbar max-h-24 overflow-y-auto border border-zinc-800"></p>
+            
+            <div class="mb-6">
+                <h4 class="text-xs font-bold text-zinc-500 mb-3 uppercase tracking-wider">KATILACAKLAR (<span id="es-count" class="text-blue-500">0</span>)</h4>
+                <div id="es-attendees" class="flex flex-wrap gap-2 max-h-24 overflow-y-auto custom-scrollbar"></div>
+            </div>
+
+            <div class="grid grid-cols-2 gap-3">
+                <button id="btn-join" onclick="toggleJoinEvent()" class="col-span-2 py-4 rounded-xl font-bold text-lg shadow-lg transition tracking-wide teko-font text-2xl"></button>
+                <button id="btn-del-event" onclick="deleteEvent()" class="hidden col-span-2 bg-red-950/50 hover:bg-red-900 border border-red-900/50 text-red-500 py-3 rounded-xl text-sm font-bold mt-2 transition">SİL (Yönetici)</button>
+            </div>
+        </div>
+
+        <div id="market-detail-modal" class="hidden fixed inset-0 bg-black/95 flex items-center justify-center z-[9999] px-4 backdrop-blur-md">
+            <div class="bg-zinc-900 w-full max-w-md rounded-2xl p-6 border border-zinc-700 relative flex flex-col max-h-[90dvh] shadow-2xl">
+                <button onclick="document.getElementById('market-detail-modal').classList.add('hidden')" class="absolute top-4 right-4 bg-darker hover:bg-zinc-800 w-8 h-8 rounded-full flex items-center justify-center text-zinc-400 hover:text-white transition z-10 border border-zinc-700">✕</button>
+                <div id="md-photos" class="market-img-scroll mb-4 shrink-0 h-48 bg-darker rounded-xl items-center custom-scrollbar border border-zinc-800"></div>
+                <div class="overflow-y-auto flex-1 pr-2 custom-scrollbar">
+                    <h3 id="md-title" class="text-3xl text-red-500 mb-1 teko-font tracking-wide"></h3>
+                    <div id="md-price" class="text-xl font-bold text-white mb-6 bg-red-950/30 inline-block px-3 py-1 rounded-lg border border-red-900/30"></div>
+                    <div class="flex items-center gap-3 mb-6 bg-darker p-3 rounded-xl cursor-pointer hover:bg-zinc-800 transition border border-zinc-800" onclick="if(window.currentOwner) showOtherProfile(window.currentOwner)">
+                        <img id="md-owner-avatar" class="w-10 h-10 rounded-lg object-cover border border-zinc-600">
+                        <div>
+                            <div class="text-[10px] text-zinc-500 uppercase font-bold tracking-wider">Satıcı</div>
+                            <div id="md-owner" class="text-sm font-bold text-zinc-200"></div>
+                        </div>
+                    </div>
+                    <p id="md-desc" class="text-sm text-zinc-300 mb-6 whitespace-pre-wrap break-all leading-relaxed"></p>
+                    <div class="bg-blue-950/30 border border-blue-900/50 p-4 rounded-xl mb-4">
+                        <div class="text-xs text-blue-500 mb-1 uppercase font-bold tracking-wider">📞 İletişim</div>
+                        <div id="md-contact" class="font-bold text-white break-all"></div>
+                    </div>
+                </div>
+                <button id="md-del-btn" onclick="deleteMarketItem()" class="hidden w-full bg-red-800 hover:bg-red-700 py-4 rounded-xl font-bold mt-2 shrink-0 text-white transition tracking-widest teko-font text-xl">İLAN SİL</button>
+            </div>
+        </div>
+
+        <div id="nearby-routes-modal" class="hidden fixed inset-0 bg-black/95 flex items-center justify-center z-[9999] px-4 backdrop-blur-sm">
+            <div class="bg-zinc-900 w-full max-w-md rounded-2xl p-6 border border-zinc-700 relative max-h-[80dvh] flex flex-col shadow-2xl">
+                <button onclick="document.getElementById('nearby-routes-modal').classList.add('hidden')" class="absolute top-4 right-4 bg-darker hover:bg-zinc-800 w-8 h-8 rounded-full flex items-center justify-center text-zinc-400 hover:text-white transition border border-zinc-800">✕</button>
+                <h2 class="text-3xl text-red-500 mb-4 teko-font tracking-wide border-b border-zinc-800 pb-2">📍 YAKIN ROTALAR</h2>
+                <div id="nr-list" class="flex-1 overflow-y-auto pr-2 space-y-2 custom-scrollbar"></div>
+            </div>
+        </div>
+
+        <div id="other-profile-modal" class="hidden fixed inset-0 bg-black/95 flex items-center justify-center z-[9999] px-4 backdrop-blur-sm">
+            <div class="bg-zinc-900 w-full max-w-sm rounded-2xl p-6 border border-zinc-700 relative text-center shadow-2xl">
+                <button onclick="document.getElementById('other-profile-modal').classList.add('hidden')" class="absolute top-4 right-4 bg-darker hover:bg-zinc-800 text-zinc-400 hover:text-white w-8 h-8 rounded-full flex items-center justify-center transition border border-zinc-800">✕</button>
+                
+                <img id="op-avatar" src="" class="w-24 h-24 mx-auto rounded-xl object-cover border-4 border-red-700 shadow-lg mt-4">
+                <div id="op-username" class="text-2xl font-bold mt-4 text-white break-all"></div>
+                <div id="op-bio" class="text-zinc-500 mt-1 text-sm italic min-h-[20px] break-all"></div>
+                
+                <div class="flex justify-center gap-4 mt-6 text-sm bg-darker py-3 rounded-xl border border-zinc-800">
+                    <div class="text-center w-24">
+                        <div id="op-xp" class="text-2xl text-red-500 teko-font tracking-wide"></div>
+                        <div class="text-[10px] text-zinc-500 mt-1 font-bold">XP</div>
+                    </div>
+                    <div class="text-center border-l border-zinc-800 pl-4 w-24">
+                        <div id="op-title" class="text-md font-bold text-zinc-300 truncate uppercase"></div>
+                        <div class="text-[10px] text-zinc-500 mt-1 font-bold">UNVAN</div>
+                    </div>
+                </div>
+
+                <div class="mt-6 text-left pb-4 bg-zinc-950 p-3 rounded-xl border border-zinc-800">
+                    <h3 class="text-[10px] font-bold text-zinc-600 mb-2 uppercase tracking-wider">Rozetleri</h3>
+                    <div id="op-badges" class="flex flex-wrap gap-2"></div>
+                </div>
+
+                <div id="op-actions" class="border-t border-zinc-800 pt-4 mt-2"></div>
+            </div>
+        </div>
+
+        <div id="admin-panel" class="hidden fixed inset-0 bg-black/95 flex items-center justify-center z-[9999] px-4 backdrop-blur-sm">
+            <div class="bg-zinc-900 w-full max-w-md h-[80dvh] rounded-2xl flex flex-col overflow-hidden border border-amber-700 shadow-2xl">
+                <div class="p-4 border-b border-zinc-800 flex justify-between items-center shrink-0 bg-darker">
+                    <h2 class="text-2xl text-amber-500 teko-font tracking-widest">👑 YÖNETİM</h2>
+                    <button onclick="document.getElementById('admin-panel').classList.add('hidden')" class="text-2xl text-zinc-500 hover:text-white transition">✕</button>
+                </div>
+                <div class="p-4 overflow-y-auto flex-1 space-y-6 custom-scrollbar">
+                    <div class="bg-darker p-4 rounded-xl border border-red-900/50">
+                        <h3 class="font-bold text-red-500 mb-3 text-sm uppercase tracking-wider">Sistem Durumu</h3>
+                        <div class="flex justify-between items-center bg-zinc-900 p-3 rounded-lg border border-zinc-800">
+                            <span class="text-xs text-zinc-300">Bakım Modu (Girişleri kapat)</span>
+                            <input type="checkbox" id="admin-maintenance" onchange="toggleMaintenance()" class="w-5 h-5 accent-red-600 cursor-pointer">
+                        </div>
+                    </div>
+                    <div>
+                        <button onclick="openNewsAdminModal()" class="w-full bg-blue-700 py-4 rounded-xl font-bold text-white hover:bg-blue-600 transition tracking-widest teko-font text-xl shadow-lg">+ HABER / DUYURU EKLE</button>
+                    </div>
+                    <div>
+                        <h3 class="text-xs font-bold text-zinc-600 mb-3 uppercase tracking-wider border-b border-zinc-800 pb-2">ŞİKAYETLER</h3>
+                        <div id="admin-reports" class="space-y-3"></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+        
+        <div id="news-admin-modal" class="hidden fixed inset-0 bg-black/95 flex items-center justify-center z-[9999] px-4 backdrop-blur-sm">
+            <div class="bg-zinc-900 w-full max-w-md rounded-2xl p-6 border border-zinc-700 shadow-2xl">
+                <input id="news-title" type="text" placeholder="Haber Başlığı" class="w-full bg-zinc-950 p-4 rounded-xl mb-3 outline-none text-white border border-zinc-800 focus:border-amber-600 transition">
+                <textarea id="news-content" placeholder="İçerik..." class="w-full bg-zinc-950 p-4 rounded-xl h-24 mb-6 outline-none text-white border border-zinc-800 custom-scrollbar focus:border-amber-600 transition"></textarea>
+                <div class="flex gap-3">
+                    <button onclick="document.getElementById('news-admin-modal').classList.add('hidden')" class="flex-1 bg-zinc-800 py-4 rounded-xl text-white font-bold hover:bg-zinc-700 transition">İptal</button>
+                    <button onclick="saveNews()" class="flex-1 bg-amber-700 py-4 rounded-xl font-bold text-white hover:bg-amber-600 transition tracking-widest teko-font text-xl">YAYINLA</button>
+                </div>
+            </div>
+        </div>
+
+    </div>
+
+    <script>
+        let currentUser = null;
+        let map, userLat=39.0, userLng=35.0, userMarker=null;
+        let tempLat, tempLng;
+        let db = { users: [], markers: [], messages: [], market: [], events: [], news: [], reports: [], banned: [], maintenance: false };
+        let markerLayers = [];
+        let currentMessageCount = 0;
+        let currentEventId = null;
+        let currentMarketId = null;
+        let mediaRecorder;
+        let audioChunks = [];
+        window.currentOwner = null; 
+        window.isPopupOpen = false; 
+        
+        // İşaretleme Modları
+        let isAddingMarkerMode = false; 
+        let isAddingEventMode = false;
+
+        const TITLES = [
+            { max: 499, name: "Çaylak", color: "text-zinc-400" },
+            { max: 1999, name: "Deneyimli", color: "text-blue-500" },
+            { max: 4999, name: "Usta", color: "text-amber-500" },
+            { max: 999999, name: "Efsane", color: "text-red-500 neon-glow" }
+        ];
+
+        async function sendAction(action, data) {
+            const res = await fetch('/api/data', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action, data }) });
+            const result = await res.json();
+            if(result.status === 'error') { alert(result.message); throw new Error(result.message); }
+            return result;
+        }
+
+        async function loadData(isInitial = false) {
+            try {
+                const res = await fetch('/api/data');
+                const newData = await res.json();
+                
+                // Kasma önleme: Eğer mesaj veya pin sayısı değişmediyse DOM'u zorlama.
+                let dataChanged = false;
+                if(db.messages.length !== newData.messages.length || db.markers.length !== newData.markers.length || db.events.length !== newData.events.length) {
+                    dataChanged = true;
+                }
+                
+                db = newData;
+                
+                if (currentUser) {
+                    const me = db.users.find(u => u.username === currentUser.username);
+                    if (me) {
+                        currentUser = me;
+                        localStorage.setItem("fr_user", JSON.stringify(currentUser));
+                        updateProfileUI();
+                    }
+                    if (db.banned.includes(currentUser.username) || (db.maintenance && currentUser.role !== 'Admin')) {
+                        logout();
+                    }
+                }
+                return dataChanged || isInitial;
+            } catch(e) { console.error("Veri çekilemedi", e); return false; }
+        }
+
+        window.onload = async function() {
+            // Beni Hatırla Kontrolü
+            const savedUsername = localStorage.getItem("fr_remembered_username");
+            if(savedUsername) {
+                document.getElementById("login-username").value = savedUsername;
+                document.getElementById("remember-me").checked = true;
+            }
+
+            await loadData(true);
+            const saved = localStorage.getItem("fr_user");
+            if (saved) currentUser = JSON.parse(saved);
+
+            if (currentUser && !db.banned.includes(currentUser.username)) {
+                if(db.maintenance && currentUser.role !== 'Admin') {
+                    alert("Sistem bakımda.");
+                    logout();
+                } else {
+                    loginSuccess();
+                }
+            }
+
+            // KASMA SORUNU ÇÖZÜMÜ: 1 saniye olan intervali 5 saniyeye (5000ms) çektik.
+            // Sadece değişiklik varsa haritayı ve dom'u zorla.
+            setInterval(async () => {
+                const changed = await loadData();
+                if(currentUser && map) {
+                    if (changed) syncMap(); // Sadece pin/event değiştiyse sil baştan kur
+                    
+                    if(db.messages.length > currentMessageCount) {
+                        renderChat();
+                        const lastMsg = db.messages[db.messages.length - 1];
+                        if(lastMsg.user !== currentUser.username) {
+                            try {
+                                const audio = document.getElementById("notif-sound");
+                                audio.currentTime = 0; 
+                                audio.play().catch(e => console.log("Ses engellendi"));
+                            } catch(e) {}
+                        }
+                        currentMessageCount = db.messages.length;
+                    }
+                    
+                    renderMarket();
+                    renderNews();
+                    renderRank();
+                }
+            }, 5000); 
+        };
+
+        function showLoginTab() {
+            document.getElementById("login-form").classList.remove("hidden");
+            document.getElementById("register-form").classList.add("hidden");
+            document.getElementById("login-tab-btn").classList.add("border-b-2","border-red-600","text-red-500");
+            document.getElementById("register-tab-btn").classList.remove("border-b-2","border-red-600","text-red-500");
+        }
+        function showRegisterTab() {
+            document.getElementById("login-form").classList.add("hidden");
+            document.getElementById("register-form").classList.remove("hidden");
+            document.getElementById("register-tab-btn").classList.add("border-b-2","border-red-600","text-red-500");
+            document.getElementById("login-tab-btn").classList.remove("border-b-2","border-red-600","text-red-500");
+        }
+
+        async function handleLogin() {
+            const u = document.getElementById("login-username").value, p = document.getElementById("login-password").value;
+            const remember = document.getElementById("remember-me").checked;
+            
+            if(!u || !p) return;
+            try {
+                const res = await sendAction('login', {username:u, password:p});
+                currentUser = res.user;
+                localStorage.setItem("fr_user", JSON.stringify(currentUser));
+                
+                if (remember) localStorage.setItem("fr_remembered_username", u);
+                else localStorage.removeItem("fr_remembered_username");
+                
+                loginSuccess();
+            } catch(e) {}
+        }
+
+        async function handleRegister() {
+            const u = document.getElementById("reg-username").value, p = document.getElementById("reg-password").value;
+            const n = document.getElementById("reg-name").value, c = document.getElementById("reg-city").value;
+            if(!u||!p||!n||!c) return alert("Boş alan bırakmayın!");
+            try {
+                const avatarUrl = `https://loremflickr.com/128/128/mountainbike,freeride,downhill?random=${u}`;
+                await sendAction('register', {username:u, password:p, name:n, city:c, xp:100, avatar:avatarUrl});
+                alert("Kayıt başarılı! Sahaya inebilirsin.");
+                showLoginTab();
+                
+                // Kayıt olanı oto hatırla
+                document.getElementById("login-username").value = u;
+                document.getElementById("login-password").value = p;
+                document.getElementById("remember-me").checked = true;
+            } catch(e) {}
+        }
+
+        async function logout() {
+            await sendAction('logout', {});
+            localStorage.removeItem("fr_user");
+            location.reload();
+        }
+
+        function loginSuccess() {
+            document.getElementById("login-screen").classList.add("hidden");
+            document.getElementById("main-app").classList.remove("hidden");
+            updateProfileUI();
+            initMap();
+            switchTab(0);
+            renderChat();
+            currentMessageCount = db.messages.length;
+        }
+
+        function getTitle(xp) {
+            for(let t of TITLES) { if(xp <= t.max) return t; }
+            return TITLES[TITLES.length-1];
+        }
+
+        function updateProfileUI() {
+            if(!currentUser) return;
+            document.getElementById("top-username").textContent = currentUser.username;
+            document.getElementById("top-avatar").src = currentUser.avatar;
+            
+            const title = getTitle(currentUser.xp);
+            document.getElementById("top-title").textContent = title.name;
+            document.getElementById("top-title").className = `text-[10px] font-bold uppercase tracking-wider ${title.color}`;
+            
+            document.getElementById("profile-name").textContent = currentUser.name || currentUser.username;
+            document.getElementById("profile-bio").textContent = currentUser.bio || "Bio yok";
+            document.getElementById("profile-xp").textContent = currentUser.xp;
+            document.getElementById("profile-avatar").src = currentUser.avatar;
+            document.getElementById("profile-title").textContent = title.name;
+            document.getElementById("profile-title").className = `text-lg font-bold uppercase mt-1 ${title.color}`;
+            
+            const s = currentUser.stats || {markers:0, events:0, market:0};
+            let badges = "";
+            if(s.markers >= 5) badges += `<span class="bg-blue-950/50 text-blue-400 border border-blue-900/50 px-3 py-1 rounded-lg text-[10px] font-bold shadow-sm uppercase tracking-wider">📍 Yer Uzmanı</span>`;
+            if(s.events >= 3) badges += `<span class="bg-purple-950/50 text-purple-400 border border-purple-900/50 px-3 py-1 rounded-lg text-[10px] font-bold shadow-sm uppercase tracking-wider">👑 Sürüş Kralı</span>`;
+            if(s.market >= 2) badges += `<span class="bg-green-950/50 text-green-400 border border-green-900/50 px-3 py-1 rounded-lg text-[10px] font-bold shadow-sm uppercase tracking-wider">🤝 Aktif Satıcı</span>`;
+            if(badges==="") badges = "<span class='text-zinc-500 text-xs italic'>Henüz rozet yok.</span>";
+            
+            document.getElementById("profile-badges").innerHTML = badges;
+            document.getElementById("admin-btn").classList.toggle("hidden", currentUser.role !== 'Admin');
+        }
+
+        function showOtherProfile(targetUsername) {
+            if(targetUsername === currentUser.username) {
+                switchTab(5); 
+                document.getElementById('market-detail-modal').classList.add('hidden');
+                document.getElementById('event-sheet').classList.add('hidden');
+                return;
+            }
+
+            const u = db.users.find(x => x.username === targetUsername);
+            if(!u) return alert("Kullanıcı bulunamadı!");
+
+            document.getElementById("op-avatar").src = u.avatar || `https://loremflickr.com/128/128/mountainbike?random=${u.username}`;
+            document.getElementById("op-username").textContent = u.name || u.username;
+            document.getElementById("op-bio").textContent = u.bio || "Kullanıcı biyo girmemiş.";
+            document.getElementById("op-xp").textContent = u.xp;
+            
+            const title = getTitle(u.xp);
+            document.getElementById("op-title").textContent = title.name;
+            document.getElementById("op-title").className = `text-md font-bold truncate uppercase ${title.color}`;
+            
+            const s = u.stats || {markers:0, events:0, market:0};
+            let badges = "";
+            if(s.markers >= 5) badges += `<span class="bg-blue-950/50 text-blue-400 border border-blue-900/50 px-3 py-1 rounded-lg text-[10px] font-bold shadow-sm uppercase tracking-wider">📍 Yer Uzmanı</span>`;
+            if(s.events >= 3) badges += `<span class="bg-purple-950/50 text-purple-400 border border-purple-900/50 px-3 py-1 rounded-lg text-[10px] font-bold shadow-sm uppercase tracking-wider">👑 Sürüş Kralı</span>`;
+            if(s.market >= 2) badges += `<span class="bg-green-950/50 text-green-400 border border-green-900/50 px-3 py-1 rounded-lg text-[10px] font-bold shadow-sm uppercase tracking-wider">🤝 Aktif Satıcı</span>`;
+            if(badges==="") badges = "<span class='text-zinc-500 text-xs'>Kullanıcının henüz rozeti yok.</span>";
+            
+            document.getElementById("op-badges").innerHTML = badges;
+
+            let actionsHtml = `<button onclick="reportUser('${u.username}')" class="bg-darker hover:bg-red-950 text-red-500 py-3 px-4 rounded-xl text-sm font-bold w-full transition border border-red-900/50">🚨 Kullanıcıyı Şikayet Et</button>`;
+            
+            if(currentUser.role === 'Admin') {
+                actionsHtml += `<div class="flex gap-2 mt-3 mb-3">
+                    <input id="admin-xp-amount" type="number" placeholder="XP Miktarı" class="w-1/2 bg-zinc-800 text-white rounded-xl px-3 py-2 text-sm border border-zinc-700">
+                    <button onclick="giveXP('${u.username}')" class="w-1/2 bg-green-700 hover:bg-green-600 text-white py-2 rounded-xl text-xs font-bold shadow-md transition uppercase">XP VER</button>
+                </div>`;
+                
+                actionsHtml += `<div class="flex gap-2 mt-3">
+                    <button onclick="banUser('${u.username}')" class="bg-red-700 hover:bg-red-600 text-white py-3 px-4 rounded-xl text-xs font-bold flex-1 shadow-md transition uppercase">Banla</button>`;
+                
+                if (u.role === 'Admin') {
+                    actionsHtml += `<button onclick="removeAdmin('${u.username}')" class="bg-zinc-700 hover:bg-zinc-600 text-white py-3 px-4 rounded-xl text-xs font-bold flex-1 shadow-md transition uppercase">Yetki Al</button>`;
+                } else {
+                    actionsHtml += `<button onclick="makeAdmin('${u.username}')" class="bg-amber-700 hover:bg-amber-600 text-white py-3 px-4 rounded-xl text-xs font-bold flex-1 shadow-md transition uppercase">Admin Yap</button>`;
+                }
+                actionsHtml += `</div>`;
+            }
+            document.getElementById("op-actions").innerHTML = actionsHtml;
+            document.getElementById("other-profile-modal").classList.remove("hidden");
+        }
+
+        async function reportUser(username) {
+            const reason = prompt(`Lütfen ${username} adlı kullanıcıyı neden şikayet ettiğini kısaca yaz:`);
+            if(reason !== null && reason.trim() !== "") {
+                await sendAction('add_report', {user: username, reason: reason});
+                alert("Şikayetiniz yöneticilere iletildi. Teşekkürler!");
+                document.getElementById("other-profile-modal").classList.add("hidden");
+            }
+        }
+
+        async function makeAdmin(username) {
+            if(confirm(username + " adlı kullanıcıya ADMIN yetkisi vermek istediğine emin misin?")) {
+                await sendAction('update_user_role', {username: username, role: 'Admin'});
+                alert(username + " artık bir Admin!");
+                document.getElementById("other-profile-modal").classList.add("hidden");
+                loadData();
+            }
+        }
+
+        async function removeAdmin(username) {
+            if(confirm(username + " adlı kullanıcının ADMIN yetkisini almak istediğine emin misin?")) {
+                await sendAction('update_user_role', {username: username, role: 'user'});
+                alert(username + " artık normal bir kullanıcı!");
+                document.getElementById("other-profile-modal").classList.add("hidden");
+                loadData();
+            }
+        }
+
+        // ================= MAP & EVENTS & YAKIN ROTALAR =================
+        function initMap() {
+            if(map) return;
+            map = L.map('map', {zoomControl: false}).setView([39.0, 35.0], 6);
+            
+            // Daha dark bir tile layer (Karanlık tema hissi için)
+            L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
+                attribution: '&copy; <a href="https://carto.com/">CARTO</a>'
+            }).addTo(map);
+            
+            syncMap(true);
+            
+            map.on('popupopen', () => window.isPopupOpen = true);
+            map.on('popupclose', () => window.isPopupOpen = false);
+            
+            map.on('click', function(e) {
+                if(!isAddingMarkerMode && !isAddingEventMode) return;
+                
+                tempLat = e.latlng.lat; 
+                tempLng = e.latlng.lng;
+                
+                if (isAddingMarkerMode) {
+                    toggleAddMarkerMode(); 
+                    openAddMarkerModal();
+                } else if (isAddingEventMode) {
+                    toggleAddEventMode();
+                    openAddEventModal();
+                }
+            });
+            autoZoomToUserLocation();
+        }
+        
+        function toggleAddMarkerMode() {
+            if(isAddingEventMode) toggleAddEventMode(); // diğerini kapat
+            isAddingMarkerMode = !isAddingMarkerMode;
+            
+            const btn = document.getElementById("btn-add-marker-mode");
+            const mapContainer = document.getElementById("map");
+            const toastId = "map-toast-marker";
+            
+            if(isAddingMarkerMode) {
+                btn.classList.remove("bg-red-700", "border-red-900");
+                btn.classList.add("bg-green-600", "border-green-800", "animate-pulse");
+                btn.innerHTML = "❌ Haritadan Yer Seç (İptal)";
+                mapContainer.classList.add("map-add-mode");
+                
+                const toast = document.createElement("div");
+                toast.id = toastId;
+                toast.className = "absolute top-20 left-1/2 -translate-x-1/2 bg-green-600 text-white px-4 py-2 rounded-xl font-bold text-sm shadow-[0_0_15px_rgba(22,163,74,0.6)] z-[9999] pointer-events-none text-center border border-green-400";
+                toast.innerHTML = "📍 Rampa eklenecek yere<br>haritadan dokunun!";
+                document.getElementById("screen-map").appendChild(toast);
+            } else {
+                btn.classList.add("bg-red-700", "border-red-900");
+                btn.classList.remove("bg-green-600", "border-green-800", "animate-pulse");
+                btn.innerHTML = "📍 Rampa İşaretle";
+                mapContainer.classList.remove("map-add-mode");
+                const toast = document.getElementById(toastId);
+                if(toast) toast.remove();
+            }
+        }
+
+        // YENİ: Buluşma ekleme modu
+        function toggleAddEventMode() {
+            if(isAddingMarkerMode) toggleAddMarkerMode(); // diğerini kapat
+            isAddingEventMode = !isAddingEventMode;
+            
+            const btn = document.getElementById("btn-add-event-mode");
+            const mapContainer = document.getElementById("map");
+            const toastId = "map-toast-event";
+            
+            if(isAddingEventMode) {
+                btn.classList.remove("bg-blue-700", "border-blue-900");
+                btn.classList.add("bg-green-600", "border-green-800", "animate-pulse");
+                btn.innerHTML = "❌ Haritadan Yer Seç (İptal)";
+                mapContainer.classList.add("map-add-mode");
+                
+                const toast = document.createElement("div");
+                toast.id = toastId;
+                toast.className = "absolute top-20 left-1/2 -translate-x-1/2 bg-blue-600 text-white px-4 py-2 rounded-xl font-bold text-sm shadow-[0_0_15px_rgba(37,99,235,0.6)] z-[9999] pointer-events-none text-center border border-blue-400";
+                toast.innerHTML = "📅 Buluşma yerine<br>haritadan dokunun!";
+                document.getElementById("screen-map").appendChild(toast);
+            } else {
+                btn.classList.add("bg-blue-700", "border-blue-900");
+                btn.classList.remove("bg-green-600", "border-green-800", "animate-pulse");
+                btn.innerHTML = "📅 Buluşma İşaretle";
+                mapContainer.classList.remove("map-add-mode");
+                const toast = document.getElementById(toastId);
+                if(toast) toast.remove();
+            }
+        }
+        
+        function openAddMarkerModal() { 
+            document.getElementById("new-marker-name").value = "";
+            document.getElementById("new-marker-desc").value = "";
+            document.getElementById("new-marker-photo").value = "";
+            document.getElementById("new-marker-preview").classList.add("hidden");
+            document.getElementById("add-marker-modal").classList.remove("hidden"); 
+        }
+
+        function openAddEventModal() { 
+            document.getElementById("ev-title").value = "";
+            document.getElementById("ev-date").value = "";
+            document.getElementById("ev-time").value = "";
+            document.getElementById("ev-max").value = "";
+            document.getElementById("ev-desc").value = "";
+            document.getElementById("add-event-modal").classList.remove("hidden"); 
+        }
+        
+        function previewMarkerPhoto(input) {
+            if (input.files && input.files[0]) {
+                var reader = new FileReader();
+                reader.onload = function(e) {
+                    const prev = document.getElementById("new-marker-preview");
+                    prev.src = e.target.result;
+                    prev.classList.remove("hidden");
+                }
+                reader.readAsDataURL(input.files[0]);
+            }
+        }
+
+        function syncMap(force = false) {
+            if (window.isPopupOpen && !force) return;
+
+            markerLayers.forEach(l => map.removeLayer(l));
+            markerLayers = [];
+            
+            db.markers.forEach(m => {
+                const icon = L.divIcon({html:`<div class="text-3xl drop-shadow-[0_5px_10px_rgba(220,38,38,0.5)] transition-transform hover:scale-110">🏔️</div>`, className:'', iconSize:[30,30]});
+                const mk = L.marker([m.lat, m.lng], {icon}).addTo(map);
+                
+                let imgHtml = m.image ? `<img src="${m.image}" style="width:100%; height:130px; object-fit:cover; border-radius:8px; margin-bottom:12px; border: 1px solid #7f1d1d;">` : '';
+                let likesCount = m.likes ? m.likes.length : 0;
+                let reportsCount = m.fake_reports ? m.fake_reports.length : 0;
+                let isLiked = m.likes && m.likes.includes(currentUser.username);
+
+                mk.bindPopup(`
+                    <div style="min-width:180px;" class="text-white">
+                        ${imgHtml}
+                        <b class="text-red-500 text-xl tracking-wide teko-font">${m.name}</b><br>
+                        <span class="text-[10px] bg-darker text-zinc-300 px-2 py-1 rounded mt-1 inline-block border border-zinc-700 uppercase">${m.difficulty}</span>
+                        <p class="text-xs mt-3 text-zinc-400 break-words leading-relaxed max-h-24 overflow-y-auto custom-scrollbar">${m.desc}</p>
+                        
+                        <div class="flex justify-between items-center mt-4 pt-3 border-t border-zinc-800">
+                            <button id="like-btn-${m.id}" onclick="toggleLikeMarker('${m.id}')" class="text-2xl ${isLiked ? 'text-red-500' : 'text-zinc-600'} hover:scale-125 transition-transform flex items-center gap-1">
+                                ❤️ <span id="like-count-${m.id}" class="text-sm font-bold text-zinc-300">${likesCount}</span>
+                            </button>
+                            
+                            <button onclick="reportMarkerFake('${m.id}')" class="text-[10px] bg-darker text-red-500 px-2 py-1.5 rounded-lg border border-red-900/50 hover:bg-red-950 transition flex items-center gap-1 font-bold uppercase tracking-wider">
+                                🚩 Yalanla (<span id="rep-count-${m.id}">${reportsCount}</span>/3)
+                            </button>
+                        </div>
+                    </div>
+                `);
+                markerLayers.push(mk);
+            });
+
+            db.events.forEach(e => {
+                const icon = L.divIcon({html:`<div class="bg-blue-700 text-white w-10 h-10 rounded-full flex items-center justify-center border-2 border-blue-400 shadow-[0_0_15px_rgba(37,99,235,0.8)] animate-bounce font-bold">📅</div>`, className:'', iconSize:[40,40]});
+                const mk = L.marker([e.lat, e.lng], {icon}).addTo(map);
+                mk.on('click', () => showEventSheet(e));
+                markerLayers.push(mk);
+            });
+        }
+
+        async function toggleLikeMarker(id) {
+            const m = db.markers.find(x => x.id == id);
+            if (m) {
+                m.likes = m.likes || [];
+                if(m.likes.includes(currentUser.username)) {
+                    m.likes = m.likes.filter(u => u !== currentUser.username);
+                } else {
+                    m.likes.push(currentUser.username);
+                }
+                
+                const likeBtn = document.getElementById(`like-btn-${id}`);
+                const likeCount = document.getElementById(`like-count-${id}`);
+                if (likeBtn && likeCount) {
+                    likeCount.textContent = m.likes.length;
+                    likeBtn.className = m.likes.includes(currentUser.username) ? 'text-2xl text-red-500 hover:scale-125 transition-transform flex items-center gap-1' : 'text-2xl text-zinc-600 hover:scale-125 transition-transform flex items-center gap-1';
+                }
+            }
+            await sendAction('like_marker', {id});
+        }
+
+        async function reportMarkerFake(id) {
+            if(confirm("Bu noktanın haritada olmadığını mı bildiriyorsun? (3 kişi bildirdiğinde otomatik SİLİNİR!)")) {
+                const m = db.markers.find(x => x.id == id);
+                if(m) {
+                    m.fake_reports = m.fake_reports || [];
+                    if(!m.fake_reports.includes(currentUser.username)) {
+                        m.fake_reports.push(currentUser.username);
+                        const repCount = document.getElementById(`rep-count-${id}`);
+                        if(repCount) repCount.textContent = m.fake_reports.length;
+                        
+                        if(m.fake_reports.length >= 3) {
+                            alert("Bu konum 3 şikayet aldığı için haritadan SİLİNDİ!");
+                            map.closePopup();
+                            db.markers = db.markers.filter(x => x.id != id);
+                            syncMap(true); 
+                        } else {
+                            alert("Şikayetiniz alındı.");
+                        }
+                    } else {
+                        alert("Bunu zaten daha önce şikayet ettin.");
+                    }
+                }
+                await sendAction('report_marker_fake', {id});
+            }
+        }
+
+        function getDistanceFromLatLonInKm(lat1, lon1, lat2, lon2) {
+            const R = 6371; 
+            const dLat = (lat2 - lat1) * Math.PI / 180;
+            const dLon = (lon2 - lon1) * Math.PI / 180;
+            const a = Math.sin(dLat/2) * Math.sin(dLat/2) + Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) * Math.sin(dLon/2) * Math.sin(dLon/2);
+            const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+            return R * c;
+        }
+
+        function showNearbyRoutes() {
+            if(!userLat || !userLng) {
+                return alert("Lütfen önce konumunuzun bulunmasını bekleyin veya '🎯' butonuna basın.");
+            }
+            
+            let routesWithDist = db.markers.map(m => {
+                m.distance = getDistanceFromLatLonInKm(userLat, userLng, m.lat, m.lng);
+                return m;
+            }).sort((a,b) => a.distance - b.distance);
+
+            let html = "";
+            routesWithDist.forEach(m => {
+                html += `
+                <div onclick="goToMarker(${m.lat}, ${m.lng})" class="bg-darker p-4 rounded-xl mb-2 flex justify-between items-center cursor-pointer border border-zinc-800 hover:border-red-900/50 hover:bg-zinc-900 transition shadow-sm">
+                    <div>
+                        <div class="font-bold text-zinc-200 text-sm break-all">${m.name}</div>
+                        <div class="text-[10px] text-zinc-500 mt-1 uppercase">${m.difficulty}</div>
+                    </div>
+                    <div class="text-red-500 text-sm font-bold whitespace-nowrap ml-2 teko-font text-lg">${m.distance.toFixed(1)} KM</div>
+                </div>`;
+            });
+            
+            document.getElementById("nr-list").innerHTML = html || "<div class='text-zinc-600 text-sm text-center py-4'>Çevrede hiç rampa bulunamadı. Haritaya sen ekle!</div>";
+            document.getElementById("nearby-routes-modal").classList.remove("hidden");
+        }
+
+        function goToMarker(lat, lng) {
+            document.getElementById("nearby-routes-modal").classList.add("hidden");
+            map.setView([lat, lng], 15);
+        }
+
+        async function saveNewMarker() {
+            const name = document.getElementById("new-marker-name").value;
+            const diff = document.getElementById("new-marker-difficulty").value;
+            const desc = document.getElementById("new-marker-desc").value;
+            const photoFile = document.getElementById("new-marker-photo").files[0];
+
+            if(!name) return alert("Rampa adını girmelisin!");
+            
+            let base64Photo = null;
+            if(photoFile) {
+                const reader = new FileReader();
+                base64Photo = await new Promise(res => { reader.onload = e => res(e.target.result); reader.readAsDataURL(photoFile); });
+            }
+
+            await sendAction('add_marker', {id:Date.now(), lat:tempLat, lng:tempLng, name, difficulty:diff, desc, image: base64Photo});
+            currentUser.xp += 50;
+            if(!currentUser.stats) currentUser.stats = {};
+            currentUser.stats.markers = (currentUser.stats.markers||0) + 1;
+            await sendAction('update_user', currentUser);
+            
+            document.getElementById("add-marker-modal").classList.add("hidden");
+            loadData(true);
+            alert("Rampa eklendi! +50 XP kazandın.");
+        }
+
+        async function saveEvent() {
+            const title = document.getElementById("ev-title").value;
+            const date = document.getElementById("ev-date").value;
+            const time = document.getElementById("ev-time").value;
+            const max = document.getElementById("ev-max").value;
+            const desc = document.getElementById("ev-desc").value;
+            if(!title || !date || !time) return alert("Başlık, tarih ve saat zorunlu!");
+
+            const evData = {id:Date.now(), lat:tempLat, lng:tempLng, title, datetime:`${date} ${time}`, max, desc};
+            await sendAction('add_event', evData);
+            
+            document.getElementById("add-event-modal").classList.add("hidden");
+            loadData(true);
+            alert("Sürüş planlandı! Herkes davetli. (Sürüş günü geldiğinde +200 XP kazanacaksın)");
+        }
+
+        function showEventSheet(e) {
+            currentEventId = e.id;
+            document.getElementById("event-sheet").classList.remove("hidden");
+            document.getElementById("es-title").textContent = e.title;
+            document.getElementById("es-time").textContent = `📅 ${e.datetime}`;
+            document.getElementById("es-desc").textContent = e.desc || "Açıklama yok.";
+            
+            const att = e.attendees || [];
+            document.getElementById("es-count").textContent = `${att.length} ${e.max ? '/ '+e.max : ''}`;
+            
+            let html = "";
+            att.forEach(u => {
+                const userObj = db.users.find(x=>x.username===u) || {avatar:`https://loremflickr.com/128/128/mountainbike?random=${u}`};
+                html += `<div onclick="showOtherProfile('${u}')" class="bg-darker hover:bg-zinc-800 transition cursor-pointer border border-zinc-700 rounded-lg px-3 py-1 text-xs flex items-center gap-2 shadow-sm text-zinc-300"><img src="${userObj.avatar}" class="w-5 h-5 rounded-md">${u}</div>`;
+            });
+            document.getElementById("es-attendees").innerHTML = html;
+
+            const btn = document.getElementById("btn-join");
+            if(att.includes(currentUser.username)) {
+                btn.textContent = "SÜRÜŞTEN AYRIL";
+                btn.className = "col-span-2 py-4 rounded-xl font-bold text-lg shadow-lg bg-zinc-800 hover:bg-zinc-700 text-zinc-400 border border-zinc-700 transition teko-font text-2xl tracking-widest";
+                btn.disabled = false;
+            } else {
+                btn.textContent = "BEN DE GELİYORUM (+100 XP)";
+                btn.className = "col-span-2 py-4 rounded-xl font-bold text-lg shadow-[0_0_15px_rgba(37,99,235,0.5)] bg-blue-700 hover:bg-blue-600 text-white transition teko-font text-2xl tracking-widest";
+                if(e.max && att.length >= parseInt(e.max)) {
+                    btn.textContent = "KONTENJAN DOLU";
+                    btn.disabled = true;
+                    btn.className = "col-span-2 py-4 rounded-xl font-bold text-lg bg-darker text-zinc-600 cursor-not-allowed border border-zinc-800 teko-font text-2xl tracking-widest";
+                } else { btn.disabled = false; }
+            }
+
+            document.getElementById("btn-del-event").classList.toggle("hidden", currentUser.username !== e.creator && currentUser.role !== 'Admin');
+        }
+
+        async function toggleJoinEvent() {
+            const ev = db.events.find(x=>String(x.id) === String(currentEventId));
+            if(!ev) return;
+            const att = ev.attendees || [];
+            
+            document.getElementById("btn-join").disabled = true;
+            document.getElementById("btn-join").textContent = "İŞLENİYOR...";
+
+            if(att.includes(currentUser.username)) {
+                await sendAction('leave_event', {id: ev.id});
+                alert("Sürüşten ayrıldın.");
+            } else {
+                await sendAction('join_event', {id: ev.id});
+                alert("Sürüşe katıldın! (Tarih geldiğinde XP otomatik verilecek)");
+            }
+            
+            await loadData(true);
+            const updatedEv = db.events.find(x=>String(x.id) === String(currentEventId));
+            if(updatedEv) showEventSheet(updatedEv);
+        }
+
+        async function deleteEvent() {
+            if(confirm("Buluşmayı iptal edip silmek istiyor musun?")) {
+                await sendAction('delete_event', {id: currentEventId});
+                document.getElementById("event-sheet").classList.add("hidden");
+                loadData(true);
+            }
+        }
+
+        function autoZoomToUserLocation() {
+            if(navigator.geolocation) {
+                navigator.geolocation.getCurrentPosition(pos => {
+                    userLat = pos.coords.latitude; userLng = pos.coords.longitude;
+                    if(map) map.setView([userLat, userLng], 14);
+                });
+            }
+        }
+
+        // ================= CHAT =================
+        async function acceptChatRules() {
+            try {
+                await sendAction('accept_chat_rules', {});
+                currentUser.accepted_chat_rules = true;
+                document.getElementById("chat-rules-modal").classList.add("hidden");
+                loadData(true);
+                alert("Kuralları kabul ettiniz, artık sohbete katılabilirsiniz!");
+            } catch(e) {}
+        }
+
+        function renderChat() {
+            const container = document.getElementById("chat-messages");
+            const isScrolledToBottom = container.scrollHeight - container.clientHeight <= container.scrollTop + 30;
+            container.innerHTML = "";
+            
+            db.messages.forEach(msg => {
+                const isMe = msg.user === currentUser.username;
+                const adminDel = (currentUser.role==='Admin' || isMe) ? `<button onclick="delMsg('${msg.id}')" class="text-[9px] bg-red-950 text-red-500 px-2 rounded ml-2 hover:bg-red-900 transition border border-red-900/50 uppercase tracking-widest">Sil</button>` : '';
+                
+                let content = "";
+                if (msg.type === "photo") {
+                    content = `<img onclick="this.style.maxWidth='100%'" src="${msg.photo}" class="w-48 rounded-lg cursor-pointer shadow-md border border-zinc-800">`;
+                } else if (msg.type === "voice") {
+                    content = `<div onclick="playVoice('${msg.audio}')" class="bg-darker px-5 py-3 rounded-xl flex items-center gap-3 cursor-pointer shadow-sm border border-zinc-800"><span class="text-xl">🎙️</span><span class="${isMe ? 'text-red-400' : 'text-zinc-400'} font-bold text-xs uppercase tracking-wider">Ses Kaydı Oynat</span></div>`;
+                } else {
+                    content = `<div class="${isMe?'bg-red-900/40 text-red-100 border-red-800/50':'bg-darker border-zinc-800 text-zinc-300'} border px-4 py-2 rounded-xl text-sm whitespace-pre-wrap break-words overflow-wrap-anywhere shadow-sm inline-block leading-relaxed">${msg.text}</div>`;
+                }
+
+                container.innerHTML += `
+                    <div class="flex ${isMe ? "justify-end" : "justify-start"} mb-4 w-full">
+                        <div class="max-w-[85%]">
+                            <div class="flex items-center gap-2 mb-1 ${isMe ? 'justify-end' : 'justify-start'} text-[10px] uppercase tracking-wider">
+                                <span onclick="showOtherProfile('${msg.user}')" class="font-bold text-zinc-500 cursor-pointer hover:text-red-500 transition">${msg.user}</span> ${adminDel}
+                            </div>
+                            ${content}
+                        </div>
+                    </div>`;
+            });
+            if(isScrolledToBottom || container.scrollTop === 0) container.scrollTop = container.scrollHeight;
+        }
+
+        async function sendChatMessage() {
+            if(!currentUser.accepted_chat_rules && currentUser.role !== "Admin") {
+                document.getElementById("chat-rules-modal").classList.remove("hidden");
+                return;
+            }
+
+            const inp = document.getElementById("chat-input");
+            if(!inp.value.trim()) return;
+            const text = inp.value;
+            inp.value = "";
+            
+            const tempId = Date.now().toString();
+            db.messages.push({id: tempId, text: text, type: "text", user: currentUser.username});
+            renderChat();
+            currentMessageCount = db.messages.length; 
+            
+            await sendAction('add_message', {id: tempId, text: text, type:"text"});
+            loadData(true); 
+        }
+
+        async function delMsg(id) { 
+            db.messages = db.messages.filter(m => m.id != id);
+            renderChat();
+            currentMessageCount = db.messages.length;
+            await sendAction('delete_message', {id}); 
+        }
+
+        function openPhotoUpload() {
+            if(!currentUser.accepted_chat_rules && currentUser.role !== "Admin") {
+                document.getElementById("chat-rules-modal").classList.remove("hidden");
+                return;
+            }
+
+            const input = document.createElement("input");
+            input.type = "file"; input.accept = "image/*";
+            input.onchange = e => {
+                const reader = new FileReader();
+                reader.onload = async ev => {
+                    const tempId = Date.now().toString();
+                    db.messages.push({id: tempId, photo: ev.target.result, type: "photo", user: currentUser.username});
+                    renderChat();
+                    currentMessageCount = db.messages.length;
+                    
+                    await sendAction('add_message', {id: tempId, photo: ev.target.result, type:"photo"});
+                    loadData(true);
+                };
+                reader.readAsDataURL(e.target.files[0]);
+            };
+            input.click();
+        }
+
+        function toggleVoiceRecord() {
+            if(!currentUser.accepted_chat_rules && currentUser.role !== "Admin") {
+                document.getElementById("chat-rules-modal").classList.remove("hidden");
+                return;
+            }
+
+            const btn = document.getElementById("voice-btn");
+            if (!mediaRecorder || mediaRecorder.state === "inactive") {
+                navigator.mediaDevices.getUserMedia({audio:true}).then(stream => {
+                    mediaRecorder = new MediaRecorder(stream);
+                    audioChunks = [];
+                    mediaRecorder.ondataavailable = e => audioChunks.push(e.data);
+                    mediaRecorder.onstop = () => {
+                        const blob = new Blob(audioChunks, {type:'audio/webm'});
+                        const reader = new FileReader();
+                        reader.readAsDataURL(blob);
+                        reader.onloadend = async () => {
+                            const tempId = Date.now().toString();
+                            db.messages.push({id: tempId, audio: reader.result, type: "voice", user: currentUser.username});
+                            renderChat();
+                            currentMessageCount = db.messages.length;
+                            
+                            await sendAction('add_message', {id: tempId, audio: reader.result, type:"voice"});
+                            loadData(true);
+                        };
+                    };
+                    mediaRecorder.start();
+                    btn.classList.add("bg-red-700", "animate-pulse", "border-red-500");
+                    btn.classList.remove("bg-zinc-800", "border-zinc-700");
+                }).catch(err => alert("Mikrofon izni alınamadı!"));
+            } else {
+                mediaRecorder.stop();
+                btn.classList.remove("bg-red-700", "animate-pulse", "border-red-500");
+                btn.classList.add("bg-zinc-800", "border-zinc-700");
+            }
+        }
+
+        function playVoice(url) { new Audio(url).play(); }
+
+        // ================= PROFİL AYARLARI =================
+        function openSettingsModal() {
+            if(!currentUser) return;
+            document.getElementById("edit-name").value = currentUser.name || currentUser.username;
+            document.getElementById("edit-bio").value = currentUser.bio || "";
+            document.getElementById("edit-password").value = "";
+            document.getElementById("settings-modal").classList.remove("hidden");
+        }
+
+        function closeSettingsModal() { document.getElementById("settings-modal").classList.add("hidden"); }
+
+        async function saveSettings() {
+            currentUser.name = document.getElementById("edit-name").value;
+            currentUser.bio = document.getElementById("edit-bio").value;
+            const newPass = document.getElementById("edit-password").value;
+            
+            if (newPass) currentUser.password = newPass; 
+            
+            await sendAction('update_user', currentUser);
+            closeSettingsModal();
+            alert("✅ Profil ayarları kaydedildi!");
+            updateProfileUI();
+        }
+
+        function changeProfilePic() { document.getElementById("pic-upload").click(); }
+
+        function uploadProfilePic(input) {
+            if (!input.files[0]) return;
+            const reader = new FileReader();
+            reader.onload = async e => {
+                currentUser.avatar = e.target.result;
+                await sendAction('update_user', currentUser);
+                updateProfileUI();
+                alert("Profil fotoğrafı güncellendi!");
+            };
+            reader.readAsDataURL(input.files[0]);
+        }
+
+        // ================= MARKET (EKİPMAN PAZARI) =================
+        function openMarketModal() {
+            document.getElementById("mk-title").value = "";
+            document.getElementById("mk-price").value = "";
+            document.getElementById("mk-contact").value = "";
+            document.getElementById("mk-desc").value = "";
+            document.getElementById("mk-photos").value = "";
+            document.getElementById("market-modal").classList.remove("hidden");
+        }
+
+        async function saveMarketItem() {
+            const t = document.getElementById("mk-title").value;
+            const p = document.getElementById("mk-price").value;
+            const c = document.getElementById("mk-contact").value;
+            const d = document.getElementById("mk-desc").value;
+            const files = document.getElementById("mk-photos").files;
+            
+            if(!t || !p || !c) return alert("Başlık, Fiyat ve İletişim zorunludur!");
+            if(files.length > 5) return alert("En fazla 5 fotoğraf ekleyebilirsiniz!");
+
+            const base64Images = [];
+            for(let i=0; i<files.length; i++) {
+                const reader = new FileReader();
+                const promise = new Promise(res => { reader.onload = e => res(e.target.result); });
+                reader.readAsDataURL(files[i]);
+                base64Images.push(await promise);
+            }
+
+            try {
+                await sendAction('add_market', {id:Date.now(), title:t, price:p, contact:c, desc:d, images:base64Images});
+                
+                if(!currentUser.stats) currentUser.stats = {};
+                currentUser.stats.market = (currentUser.stats.market||0) + 1;
+                await sendAction('update_user', currentUser);
+                
+                document.getElementById("market-modal").classList.add("hidden");
+                alert("İlanınız pazara eklendi!");
+                loadData(true);
+            } catch(e) {}
+        }
+
+        function renderMarket() {
+            const c = document.getElementById("market-list"); c.innerHTML = "";
+            if(db.market.length === 0) c.innerHTML = "<div class='col-span-2 text-center text-zinc-600 py-10 italic'>Pazar şu an boş.</div>";
+            
+            [...db.market].reverse().forEach(m => {
+                const img = m.images && m.images.length > 0 ? m.images[0] : 'https://placehold.co/400x400/121214/FFF?text=FOTO+YOK';
+                c.innerHTML += `
+                <div onclick="openMarketDetail('${m.id}')" class="bg-darker rounded-xl overflow-hidden border border-zinc-800 cursor-pointer shadow-md hover:border-red-900 transition">
+                    <img src="${img}" class="w-full h-32 object-cover">
+                    <div class="p-3">
+                        <div class="font-bold text-sm text-zinc-200 truncate">${m.title}</div>
+                        <div class="text-red-500 font-bold text-lg mt-1 teko-font tracking-wide">${m.price} TL</div>
+                    </div>
+                </div>`;
+            });
+        }
+
+        function openMarketDetail(id) {
+            currentMarketId = id;
+            const m = db.market.find(x => String(x.id) === String(id));
+            if(!m) return;
+            
+            document.getElementById("md-title").textContent = m.title;
+            document.getElementById("md-price").textContent = m.price + " TL";
+            document.getElementById("md-desc").textContent = m.desc || "";
+            document.getElementById("md-contact").textContent = m.contact;
+            
+            window.currentOwner = m.owner;
+            const ownerObj = db.users.find(x=>x.username === m.owner) || {avatar:`https://loremflickr.com/128/128/mountainbike?random=${m.owner}`};
+            document.getElementById("md-owner").textContent = m.owner;
+            document.getElementById("md-owner-avatar").src = ownerObj.avatar;
+
+            const pContainer = document.getElementById("md-photos");
+            pContainer.innerHTML = "";
+            if(m.images && m.images.length > 0) {
+                m.images.forEach(img => pContainer.innerHTML += `<img src="${img}" class="h-full object-contain bg-black rounded-lg">`);
+            } else {
+                pContainer.innerHTML = `<img src="https://placehold.co/400x400/121214/FFF?text=FOTO+YOK" class="h-full w-full object-cover rounded-lg">`;
+            }
+
+            const delBtn = document.getElementById("md-del-btn");
+            if(m.owner === currentUser.username || currentUser.role === 'Admin') {
+                delBtn.classList.remove("hidden");
+            } else { delBtn.classList.add("hidden"); }
+
+            document.getElementById("market-detail-modal").classList.remove("hidden");
+        }
+
+        async function deleteMarketItem() {
+            if(confirm("İlanı silmek istediğine emin misin?")) {
+                await sendAction('delete_market', {id: currentMarketId});
+                document.getElementById("market-detail-modal").classList.add("hidden");
+                loadData(true);
+            }
+        }
+
+        // ================= DİĞER FONKSİYONLAR =================
+        function switchTab(n) {
+            const tabs = ["screen-map", "screen-chat", "screen-market", "screen-rank", "screen-news", "screen-profile"];
+            tabs.forEach((id,i) => document.getElementById(id).classList.toggle("hidden", i !== n));
+            for(let i=0; i<6; i++) {
+                if(i===4 && n!==4 && n!==3) continue; // Chat DM/Group logic
+                const b = document.getElementById(`tab-btn-${i}`);
+                if(!b) continue;
+                if(i===n) { b.classList.add("text-red-500"); b.classList.remove("text-zinc-500"); }
+                else { b.classList.remove("text-red-500"); b.classList.add("text-zinc-500"); }
+            }
+            if(n===0 && map) setTimeout(()=>map.invalidateSize(), 100);
+            
+            if(n === 1 && currentUser && !currentUser.accepted_chat_rules && currentUser.role !== 'Admin') {
+                document.getElementById("chat-rules-modal").classList.remove("hidden");
+            }
+
+            if(n===2) renderMarket();
+            if(n===3) renderRank();
+            if(n===4) renderNews();
+        }
+
+        function renderRank() {
+            const c = document.getElementById("leaderboard"); c.innerHTML = "";
+            [...db.users].sort((a,b)=>b.xp-a.xp).slice(0,20).forEach((u,i) => {
+                const t = getTitle(u.xp);
+                c.innerHTML += `<div class="flex items-center justify-between bg-darker px-4 py-3 rounded-xl border border-zinc-800 cursor-pointer hover:border-red-900/50 transition shadow-sm mb-2" onclick="showOtherProfile('${u.username}')">
+                    <div class="flex items-center gap-3">
+                        <span class="text-xl font-black w-6 text-center">${i===0?'🥇':i===1?'🥈':i===2?'🥉':i+1}</span>
+                        <img src="${u.avatar || `https://loremflickr.com/128/128/mountainbike?random=${u.username}`}" class="w-10 h-10 rounded-lg object-cover border border-zinc-700">
+                        <div><div class="font-bold text-sm break-all text-zinc-200">${u.username} ${u.role==='Admin'?'👑':''}</div><div class="text-[10px] uppercase font-bold tracking-wider ${t.color}">${t.name}</div></div>
+                    </div>
+                    <div class="text-right"><div class="text-2xl text-red-500 teko-font tracking-wider">${u.xp}</div><div class="text-[9px] text-zinc-600 font-bold uppercase">XP</div></div>
+                </div>`;
+            });
+        }
+
+        function renderNews() {
+            const c = document.getElementById("news-list"); c.innerHTML = "";
+            if(db.news.length === 0) c.innerHTML = "<div class='text-center text-zinc-600 py-10 italic'>Haber yok.</div>";
+            db.news.forEach(n => {
+                c.innerHTML += `<div class="bg-darker p-5 rounded-xl border border-zinc-800 shadow-md mb-4">
+                    <h3 class="font-bold text-xl text-red-500 mb-2 break-all teko-font tracking-wide">${n.title}</h3>
+                    <p class="text-sm text-zinc-300 whitespace-pre-wrap break-words leading-relaxed">${n.content}</p>
+                    ${currentUser.role==='Admin'?`<button onclick="delNews('${n.id}')" class="text-xs text-red-500 mt-4 font-bold bg-red-950/30 border border-red-900/30 px-3 py-1.5 rounded-lg uppercase tracking-wider">🗑️ Haberi Sil</button>`:''}
+                </div>`;
+            });
+        }
+
+        // ================= ADMIN PANELİ =================
+        function showAdminPanel() {
+            document.getElementById("admin-maintenance").checked = db.maintenance;
+            
+            const rC = document.getElementById("admin-reports"); rC.innerHTML = "";
+            db.reports.forEach(r => {
+                rC.innerHTML += `<div class="bg-zinc-900 p-4 rounded-xl border border-zinc-800 text-sm mb-3 shadow-sm">
+                    <div class="mb-1 text-zinc-300">Hedef: <b class="text-red-500">${r.user}</b></div>
+                    <div class="text-xs text-zinc-500 mb-3 bg-darker p-2 rounded border border-zinc-800">Neden: ${r.reason || 'Belirtilmedi'}</div>
+                    <button onclick="banUser('${r.user}')" class="bg-red-700 hover:bg-red-600 text-white px-3 py-2 rounded-lg text-xs font-bold w-full transition tracking-widest uppercase">Kalıcı Banla</button>
+                </div>`;
+            });
+            document.getElementById("admin-panel").classList.remove("hidden");
+        }
+
+        async function toggleMaintenance() {
+            const st = document.getElementById("admin-maintenance").checked;
+            await sendAction('toggle_maintenance', {status: st});
+            loadData(true);
+        }
+
+        function openNewsAdminModal() { document.getElementById("news-admin-modal").classList.remove("hidden"); }
+        async function saveNews() {
+            const t = document.getElementById("news-title").value, c = document.getElementById("news-content").value;
+            if(!t||!c) return;
+            await sendAction('add_news', {id:Date.now(), title:t, content:c});
+            document.getElementById("news-admin-modal").classList.add("hidden");
+            loadData(true);
+        }
+        async function delNews(id) { await sendAction('delete_news', {id}); loadData(true); }
+        async function banUser(u) {
+            if(confirm(u + " banlanacak. Emin misin?")) {
+                await sendAction('add_ban', {username: u});
+                loadData(true);
+            }
+        }
+        
+        function showProfile() { switchTab(5); }
+    </script>
+</body>
+</html>"""
+
+@app.route("/")
+def index():
+    return render_template_string(HTML_CODE)
+
+if __name__ == "__main__":
+    print("💀 V4.0 UYGULAMA AKTİF - TÜRKİYE FREERIDER GRUBU (SUPABASE GÜNCELLEMESİ)")
+    app.run(debug=False, port=5000, host="0.0.0.0")
